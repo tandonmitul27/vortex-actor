@@ -3,9 +3,13 @@
 #define COMMON_H
 #include <stdint.h>
 
+#ifndef CAP
 #define CAP   16    // ring capacity (power of 2)
+#endif
 #define L     10    // local buckets per PE (total = L * N)
+#ifndef M
 #define M     10    // updates per PE
+#endif
 
 typedef struct {
     uint32_t sender;

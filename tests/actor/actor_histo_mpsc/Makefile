@@ -1,9 +1,9 @@
 ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
-PROJECT := actor_histo
+PROJECT := actor_histo_mpsc
 
-SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
+SRC_DIR := $(VORTEX_HOME)/tests/actor/$(PROJECT)
 
 SRCS := $(SRC_DIR)/main.cpp
 

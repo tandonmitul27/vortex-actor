@@ -3,8 +3,12 @@
 #define COMMON_H
 #include <stdint.h>
 
-#define L     10    // local buckets per PE (total = L * N)
+#ifndef L
+#define L     10    // local buckets per PE (total = L * N); smaller L => fewer buckets => more contention
+#endif
+#ifndef M
 #define M     10    // updates per PE
+#endif
 
 typedef struct {
     uint64_t counts_addr;     // int[N*L]

@@ -1,14 +1,14 @@
 ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
-PROJECT := ring_for_actors
+PROJECT := actor_histo_tree
 
-SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
+SRC_DIR := $(VORTEX_HOME)/tests/actor/$(PROJECT)
 
 SRCS := $(SRC_DIR)/main.cpp
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 
-OPTS ?= 256
+OPTS ?=
 
 include ../common.mk
