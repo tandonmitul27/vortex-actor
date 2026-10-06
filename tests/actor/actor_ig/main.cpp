@@ -2,6 +2,8 @@
 // print the per-PE phase cycle breakdown.
 // Usage: ./actor_ig [-n N]   (default N = device lane count)
 
+#include <algorithm>
+#include <vector>
 #include <iostream>
 #include <vector>
 #include <vortex.h>
@@ -32,24 +34,27 @@ int main(int argc, char** argv) {
     vx_dev_caps(dev, VX_CAPS_NUM_THREADS, &threads);
     uint32_t hw_lanes = (uint32_t)(cores * warps * threads);
     uint32_t N = (N_arg > 0) ? (uint32_t)N_arg : hw_lanes;
-    std::cout << "N=" << N << " actors, M=" << M
+    std::cout << "N=" << N << " actors, TABLE_SIZE=" << TABLE_SIZE << ", M=" << M
               << " requests/PE (HW lanes available=" << hw_lanes << ")\n";
 
     size_t grid_bytes = (size_t)N * N * sizeof(ring_t);   // one N×N grid per mailbox
     size_t tgt_bytes  = (size_t)N * M * sizeof(int);      // gathered results
+    size_t table_bytes = (size_t)N * TABLE_SIZE * sizeof(int);  // owned state
     size_t phase_bytes = (size_t)N * sizeof(phase_cycles_t);
 
     // mb0 = request channels, mb1 = reply channels (both N×N grids)
-    vx_buffer_h mb0_buf, mb1_buf, tgt_buf, phase_buf, kernel_buf, args_buf;
+    vx_buffer_h mb0_buf, mb1_buf, tgt_buf, table_buf, phase_buf, kernel_buf, args_buf;
     vx_mem_alloc(dev, grid_bytes, VX_MEM_READ_WRITE, &mb0_buf);
     vx_mem_alloc(dev, grid_bytes, VX_MEM_READ_WRITE, &mb1_buf);
     vx_mem_alloc(dev, tgt_bytes,  VX_MEM_READ_WRITE, &tgt_buf);
+    vx_mem_alloc(dev, table_bytes, VX_MEM_READ_WRITE, &table_buf);
     vx_mem_alloc(dev, phase_bytes, VX_MEM_READ_WRITE, &phase_buf);
 
     args_t args;
     vx_mem_address(mb0_buf, &args.mb0_grid_addr);
     vx_mem_address(mb1_buf, &args.mb1_grid_addr);
     vx_mem_address(tgt_buf, &args.tgt_addr);
+    vx_mem_address(table_buf, &args.table_addr);
     vx_mem_address(phase_buf, &args.phase_addr);
     args.N = N;
 
@@ -58,8 +63,29 @@ int main(int argc, char** argv) {
     vx_copy_to_dev(mb1_buf, zg.data(), 0, grid_bytes);
     std::vector<char> zt(tgt_bytes, 0);
     vx_copy_to_dev(tgt_buf, zt.data(), 0, tgt_bytes);
+    // table[pe][k] = pe*1000000 + k, the same contents every other index gather
+    // kernel uses, so the verified answer is unchanged by making the load real.
+    { std::vector<int> t((size_t)N * TABLE_SIZE);
+      for (uint32_t pe = 0; pe < N; pe++)
+          for (uint32_t k = 0; k < (uint32_t)TABLE_SIZE; k++)
+              t[(size_t)pe * TABLE_SIZE + k] = (int)(pe * 1000000u + k);
+      vx_copy_to_dev(table_buf, t.data(), 0, table_bytes); }
     std::vector<char> zp(phase_bytes, 0);
     vx_copy_to_dev(phase_buf, zp.data(), 0, phase_bytes);
+
+    // No actor drains a buffer while it is still sending, so a buffer that can
+    // fill can hang the run. Replay the hash and warn before launch.
+    {
+        std::vector<uint32_t> load((size_t)N * N, 0);
+        uint32_t worst = 0;
+        for (uint32_t s = 0; s < N; s++)
+            for (uint32_t i = 0; i < (uint32_t)M; i++)
+                worst = std::max(worst, ++load[(size_t)s * N + mix(s, 2u * i + 1u) % N]);
+        if (worst + 1 > (uint32_t)CAP) {
+            std::cerr << "warning: CAP=" << CAP << " is below the worst buffer load of "
+                      << worst + 1 << " messages (data + done), so the run can hang. Use a larger CAP.\n";
+        }
+    }
 
     vx_upload_kernel_file(dev, "kernel.vxbin", &kernel_buf);
     vx_upload_bytes(dev, &args, sizeof(args), &args_buf);
@@ -74,7 +100,7 @@ int main(int argc, char** argv) {
     for (uint32_t me = 0; me < N; me++) {
         for (uint32_t i = 0; i < M; i++) {
             uint32_t dst  = mix(me, 2*i + 1) % N;     // who PE me queried
-            uint32_t lidx = mix(me, 2*i + 2) % 1000;  // the index it asked for
+            uint32_t lidx = mix(me, 2*i + 2) % TABLE_SIZE;  // the index it asked for
             expected[me * M + i] = (int)(dst * 1000000 + lidx);  // dst's reply value
         }
     }
@@ -82,7 +108,7 @@ int main(int argc, char** argv) {
     int mismatches = 0;
     for (uint32_t me = 0; me < N; me++) {
         for (uint32_t i = 0; i < M; i++) {
-            int actual = tgt[me * M + i];
+            int actual = tgt[TGT_IDX(me, i, N)];
             int exp    = expected[me * M + i];
             if (actual != exp) {
                 if (mismatches < 8) {
@@ -137,6 +163,7 @@ int main(int argc, char** argv) {
               << "  (unmeasured vote_all/loop overhead)\n";
 
     vx_mem_free(mb0_buf);    vx_mem_free(mb1_buf);   vx_mem_free(tgt_buf);
+    vx_mem_free(table_buf);
     vx_mem_free(phase_buf);
     vx_mem_free(kernel_buf); vx_mem_free(args_buf);
     vx_dev_close(dev);

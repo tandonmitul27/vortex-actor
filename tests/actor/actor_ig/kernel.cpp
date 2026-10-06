@@ -55,6 +55,7 @@ static inline uint32_t mix(uint32_t a, uint32_t b) {
 void kernel_body(args_t* __UNIFORM__ a) {
     ring_t* mb0 = (ring_t*)a->mb0_grid_addr;
     ring_t* mb1 = (ring_t*)a->mb1_grid_addr;
+    int*    tbl = (int*)a->table_addr;
     int*    tgt = (int*)a->tgt_addr;
     int     N   = a->N;
     int     me  = blockIdx.x;
@@ -68,7 +69,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
     // 1. send M requests on mb0
     for (uint32_t i = 0; i < M; i++) {
         int dst  = mix(me, 2u*i + 1u) % N;
-        int lidx = mix(me, 2u*i + 2u) % 1000;
+        int lidx = mix(me, 2u*i + 2u) % TABLE_SIZE;
         send_data(mb0, N, dst, me, /*idx=*/(int)i, /*val=*/lidx);
     }
     uint64_t t_after_send = csr_read(VX_CSR_MCYCLE);
@@ -97,7 +98,8 @@ void kernel_body(args_t* __UNIFORM__ a) {
                 if (pkt.done_flag == 1) {
                     mb0_dones++;
                 } else {
-                    int reply_val = me * 1000000 + pkt.value;
+                    // answer by LOADING my own table, not by arithmetic
+                    int reply_val = tbl[(size_t)me * TABLE_SIZE + (uint32_t)pkt.value];
                     send_data(mb1, N, pkt.sender, me, /*idx=*/pkt.idx, /*val=*/reply_val);
                 }
             }
@@ -124,7 +126,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
                 if (pkt.done_flag == 1) {
                     mb1_dones++;
                 } else {
-                    tgt[me * M + pkt.idx] = pkt.value;
+                    tgt[TGT_IDX(me, pkt.idx, N)] = pkt.value;
                 }
             }
         }

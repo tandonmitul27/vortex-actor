@@ -1,9 +1,8 @@
-// actor_histo_tree host: launch the tree-barrier kernel, verify via host RNG
-// replay, print the per-PE phase cycle breakdown. Allocates the two barrier flag
-// arrays (arrived[], released[]) in addition to the SPSC grid.
+// Host for the core-combining histogram: launch the kernel, verify against a host
+// RNG replay, print the per-PE phase breakdown. The global buffer is C*N*L ints (each
+// core's flushed combined contribution); the per-core combine buffer lives in LMEM
+// and is allocated by the kernel via __local_mem.
 
-#include <algorithm>
-#include <vector>
 #include <iostream>
 #include <vector>
 #include <vortex.h>
@@ -23,38 +22,48 @@ int main(int argc, char** argv) {
     vx_device_h dev;
     if (vx_dev_open(&dev) != 0) { std::cerr << "vx_dev_open failed\n"; return 1; }
 
-    uint64_t cores, warps, threads;
+    uint64_t cores, warps, threads, lmem_size;
     vx_dev_caps(dev, VX_CAPS_NUM_CORES,   &cores);
     vx_dev_caps(dev, VX_CAPS_NUM_WARPS,   &warps);
     vx_dev_caps(dev, VX_CAPS_NUM_THREADS, &threads);
+    vx_dev_caps(dev, VX_CAPS_LOCAL_MEM_SIZE, &lmem_size);
     uint32_t N = (uint32_t)(cores * warps * threads);
+    uint32_t C = (uint32_t)cores;
+    uint32_t P = (uint32_t)(warps * threads);
+    size_t lmem_need = (size_t)N * L * sizeof(int);    // per-core LMEM combine buffer
 
     std::cout << "N=" << N << " actors, L=" << L << " buckets/PE, M=" << M
-              << " updates/PE (Bale histogram, tree-barrier termination, "
-              << (L * N) << " total buckets)\n";
+              << " updates/PE (Bale histogram, core-combining, " << (L * N) << " total buckets)\n";
+    std::cout << "layout: " << C << " cores x " << P << " actors/core; "
+              << "per-core LMEM buffer = " << lmem_need << " B of " << lmem_size << " B\n";
+    if (lmem_need > lmem_size) {
+        std::cerr << "error: per-core LMEM buffer (" << lmem_need << " B) exceeds LMEM ("
+                  << lmem_size << " B); reduce N or L\n";
+        vx_dev_close(dev);
+        return 1;
+    }
 
-    size_t grid_bytes   = (size_t)N * N * sizeof(ring_t);
+    size_t cout_bytes   = (size_t)C * N * L * sizeof(int);      // flushed per-core buffers
     size_t counts_bytes = (size_t)N * L * sizeof(int);
     size_t phase_bytes  = (size_t)N * sizeof(phase_cycles_t);
     size_t flag_bytes   = (size_t)N * sizeof(uint32_t);
 
-    vx_buffer_h grid_buf, counts_buf, phase_buf, arr_buf, rel_buf, kernel_buf, args_buf;
-    vx_mem_alloc(dev, grid_bytes,   VX_MEM_READ_WRITE, &grid_buf);
+    vx_buffer_h cout_buf, counts_buf, phase_buf, arr_buf, rel_buf, kernel_buf, args_buf;
+    vx_mem_alloc(dev, cout_bytes,   VX_MEM_READ_WRITE, &cout_buf);
     vx_mem_alloc(dev, counts_bytes, VX_MEM_READ_WRITE, &counts_buf);
     vx_mem_alloc(dev, phase_bytes,  VX_MEM_READ_WRITE, &phase_buf);
     vx_mem_alloc(dev, flag_bytes,   VX_MEM_READ_WRITE, &arr_buf);
     vx_mem_alloc(dev, flag_bytes,   VX_MEM_READ_WRITE, &rel_buf);
 
     args_t args;
-    vx_mem_address(grid_buf,   &args.grid_addr);
+    vx_mem_address(cout_buf,   &args.cout_addr);
     vx_mem_address(counts_buf, &args.counts_addr);
     vx_mem_address(phase_buf,  &args.phase_addr);
     vx_mem_address(arr_buf,    &args.arrived_addr);
     vx_mem_address(rel_buf,    &args.released_addr);
     args.N = N;
 
-    std::vector<char> zg(grid_bytes, 0);
-    vx_copy_to_dev(grid_buf, zg.data(), 0, grid_bytes);
+    { std::vector<char> zc0(cout_bytes, 0); vx_copy_to_dev(cout_buf, zc0.data(), 0, cout_bytes); }
     std::vector<char> zc(counts_bytes, 0);
     vx_copy_to_dev(counts_buf, zc.data(), 0, counts_bytes);
     std::vector<char> zp(phase_bytes, 0);
@@ -62,20 +71,6 @@ int main(int argc, char** argv) {
     std::vector<char> zf(flag_bytes, 0);
     vx_copy_to_dev(arr_buf, zf.data(), 0, flag_bytes);
     vx_copy_to_dev(rel_buf, zf.data(), 0, flag_bytes);
-
-    // No actor drains a buffer while it is still sending, so a buffer that can
-    // fill can hang the run. Replay the hash and warn before launch.
-    {
-        std::vector<uint32_t> load((size_t)N * N, 0);
-        uint32_t worst = 0;
-        for (uint32_t s = 0; s < N; s++)
-            for (uint32_t i = 0; i < (uint32_t)M; i++)
-                worst = std::max(worst, ++load[(size_t)s * N + (mix(s, i) % (uint32_t)(L * N)) % N]);
-        if (worst > (uint32_t)CAP) {
-            std::cerr << "warning: CAP=" << CAP << " is below the worst buffer load of "
-                      << worst << " messages (data), so the run can hang. Use a larger CAP.\n";
-        }
-    }
 
     vx_upload_kernel_file(dev, "kernel.vxbin", &kernel_buf);
     vx_upload_bytes(dev, &args, sizeof(args), &args_buf);
@@ -134,18 +129,14 @@ int main(int argc, char** argv) {
     auto pct = [&](uint64_t s){ return mean_total ? 100.0 * (p(s) / mean_total) : 0.0; };
 
     std::cout << "PHASES (cycles per PE — mean, max across " << N << " PEs):\n";
-    std::cout << "  send_data:  mean=" << (uint64_t)p(sum_send_data) << "  max=" << max_send_data << "  (" << pct(sum_send_data) << "% of mean total)\n";
-    std::cout << "  send_done:  mean=" << (uint64_t)p(sum_send_done) << "  max=" << max_send_done << "  (" << pct(sum_send_done) << "%)\n";
-    std::cout << "  handle_req: mean=" << (uint64_t)p(sum_hreq) << "  max=" << max_hreq << "  (" << pct(sum_hreq) << "%)\n";
-    std::cout << "  handle_rep: mean=" << (uint64_t)p(sum_hrep) << "  max=" << max_hrep << "  (" << pct(sum_hrep) << "%)\n";
-    std::cout << "  empty_poll: mean=" << (uint64_t)p(sum_empty) << "  max=" << max_empty << "  (" << pct(sum_empty) << "%)\n";
-    std::cout << "  tail_wait:  mean=" << (uint64_t)p(sum_tail) << "  max=" << max_tail << "  (" << pct(sum_tail) << "%)\n";
+    std::cout << "  send_data:  mean=" << (uint64_t)p(sum_send_data) << "  max=" << max_send_data << "  (" << pct(sum_send_data) << "% of mean total)  [combine]\n";
+    std::cout << "  send_done:  mean=" << (uint64_t)p(sum_send_done) << "  max=" << max_send_done << "  (" << pct(sum_send_done) << "%)  [barrier]\n";
+    std::cout << "  handle_req: mean=" << (uint64_t)p(sum_hreq) << "  max=" << max_hreq << "  (" << pct(sum_hreq) << "%)  [flush]\n";
+    std::cout << "  handle_rep: mean=" << (uint64_t)p(sum_hrep) << "  max=" << max_hrep << "  (" << pct(sum_hrep) << "%)  [drain]\n";
     std::cout << "  mean_total: " << mean_total << "\n";
     std::cout << "  mean_span:  " << mean_span << "\n";
-    std::cout << "  other:      " << (mean_span > mean_total ? mean_span - mean_total : 0)
-              << "  (unmeasured vote_all/loop overhead)\n";
 
-    vx_mem_free(grid_buf);  vx_mem_free(counts_buf); vx_mem_free(phase_buf);
+    vx_mem_free(cout_buf);  vx_mem_free(counts_buf); vx_mem_free(phase_buf);
     vx_mem_free(arr_buf);   vx_mem_free(rel_buf);
     vx_mem_free(kernel_buf); vx_mem_free(args_buf);
     vx_dev_close(dev);

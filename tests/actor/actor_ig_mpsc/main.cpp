@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
     size_t inbox_bytes = (size_t)N * sizeof(inbox_t);          // per mailbox, O(N)
     size_t spsc_bytes  = (size_t)2 * N * N * sizeof(slot_t);   // ~ 2*N^2 grid (ref)
     size_t tgt_bytes   = (size_t)N * M * sizeof(int);
+    size_t table_bytes = (size_t)N * TABLE_SIZE * sizeof(int);  // owned state
     size_t phase_bytes = (size_t)N * sizeof(phase_cycles_t);
 
     std::cout << "N=" << N << " actors (1 thread each, MPSC shared inboxes), M=" << M
@@ -37,16 +38,18 @@ int main(int argc, char** argv) {
     std::cout << "inbox memory = " << (2 * inbox_bytes) << " bytes (mb0+mb1, O(N)); "
               << "an SPSC 2*N*N grid would be ~" << spsc_bytes << " bytes\n";
 
-    vx_buffer_h mb0_buf, mb1_buf, tgt_buf, phase_buf, kernel_buf, args_buf;
+    vx_buffer_h mb0_buf, mb1_buf, tgt_buf, table_buf, phase_buf, kernel_buf, args_buf;
     vx_mem_alloc(dev, inbox_bytes, VX_MEM_READ_WRITE, &mb0_buf);
     vx_mem_alloc(dev, inbox_bytes, VX_MEM_READ_WRITE, &mb1_buf);
     vx_mem_alloc(dev, tgt_bytes,   VX_MEM_READ_WRITE, &tgt_buf);
+    vx_mem_alloc(dev, table_bytes, VX_MEM_READ_WRITE, &table_buf);
     vx_mem_alloc(dev, phase_bytes, VX_MEM_READ_WRITE, &phase_buf);
 
     args_t args;
     vx_mem_address(mb0_buf,   &args.mb0_addr);
     vx_mem_address(mb1_buf,   &args.mb1_addr);
     vx_mem_address(tgt_buf,   &args.tgt_addr);
+    vx_mem_address(table_buf, &args.table_addr);
     vx_mem_address(phase_buf, &args.phase_addr);
     args.N = N;
 
@@ -65,6 +68,12 @@ int main(int argc, char** argv) {
 
     std::vector<char> zt(tgt_bytes, 0);
     vx_copy_to_dev(tgt_buf, zt.data(), 0, tgt_bytes);
+    // table[pe][k] = pe*1000000 + k, the same contents as actor_ig
+    { std::vector<int> t((size_t)N * TABLE_SIZE);
+      for (uint32_t pe = 0; pe < N; pe++)
+          for (uint32_t k = 0; k < (uint32_t)TABLE_SIZE; k++)
+              t[(size_t)pe * TABLE_SIZE + k] = (int)(pe * 1000000u + k);
+      vx_copy_to_dev(table_buf, t.data(), 0, table_bytes); }
     std::vector<char> zp(phase_bytes, 0);
     vx_copy_to_dev(phase_buf, zp.data(), 0, phase_bytes);
 
@@ -81,7 +90,7 @@ int main(int argc, char** argv) {
     for (uint32_t me = 0; me < N; me++) {
         for (uint32_t i = 0; i < M; i++) {
             uint32_t dst  = mix(me, 2*i + 1) % N;
-            uint32_t lidx = mix(me, 2*i + 2) % 1000;
+            uint32_t lidx = mix(me, 2*i + 2) % TABLE_SIZE;
             expected[me * M + i] = (int)(dst * 1000000 + lidx);
         }
     }
@@ -89,10 +98,10 @@ int main(int argc, char** argv) {
     int mismatches = 0;
     for (uint32_t me = 0; me < N; me++) {
         for (uint32_t i = 0; i < M; i++) {
-            if (tgt[me * M + i] != expected[me * M + i]) {
+            if (tgt[TGT_IDX(me, i, N)] != expected[me * M + i]) {
                 if (mismatches < 8)
                     std::cout << "  mismatch PE " << me << " query " << i << ": got "
-                              << tgt[me * M + i] << ", expected " << expected[me * M + i] << "\n";
+                              << tgt[TGT_IDX(me, i, N)] << ", expected " << expected[me * M + i] << "\n";
                 mismatches++;
             }
         }
@@ -129,7 +138,7 @@ int main(int argc, char** argv) {
     std::cout << "  tail_wait:  " << p(sum_tail) << "\n";
     std::cout << "  mean_span:  " << mean_span << "\n";
 
-    vx_mem_free(mb0_buf);    vx_mem_free(mb1_buf);   vx_mem_free(tgt_buf);
+    vx_mem_free(mb0_buf);    vx_mem_free(mb1_buf);   vx_mem_free(tgt_buf);   vx_mem_free(table_buf);
     vx_mem_free(phase_buf);  vx_mem_free(kernel_buf); vx_mem_free(args_buf);
     vx_dev_close(dev);
     return (mismatches == 0) ? 0 : 1;

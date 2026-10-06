@@ -12,8 +12,8 @@
 #include <vx_intrinsics.h>
 #include "common.h"
 
-// blocking push of a request payload (spins while full)
-static inline void send_req(ring_t* grid, int N, int dst, int sender,
+// push a data packet to dst (spins if the channel is full)
+static inline void send_data(ring_t* grid, int N, int dst, int sender,
                             int idx_field, int val_field) {
     ring_t* out = &grid[sender * N + dst];
     while (out->tail - out->head >= CAP) { }
@@ -25,7 +25,8 @@ static inline void send_req(ring_t* grid, int N, int dst, int sender,
     out->tail = out->tail + 1;
 }
 
-static inline void broadcast_done_blk(ring_t* grid, int N, int sender) {
+// send a done-flagged packet to every PE
+static inline void broadcast_done(ring_t* grid, int N, int sender) {
     for (int dst = 0; dst < N; dst++) {
         ring_t* out = &grid[sender * N + dst];
         while (out->tail - out->head >= CAP) { }
@@ -58,7 +59,7 @@ static inline int try_recv(ring_t* grid, int N, int me, int src, packet_t* out) 
 
 // service one mb0 channel: peek, commit only if the reply ring has room.
 // returns 1 = request serviced, 2 = done consumed, 0 = nothing. *dones bumped on done.
-static inline int service_one(ring_t* mb0, ring_t* mb1, int N, int me,
+static inline int service_one(ring_t* mb0, ring_t* mb1, const int* tbl, int N, int me,
                               int src, int* dones) {
     ring_t* in = &mb0[src * N + me];
     if (in->head == in->tail) return 0;
@@ -75,7 +76,7 @@ static inline int service_one(ring_t* mb0, ring_t* mb1, int N, int me,
     out->slots[out->tail % CAP].sender    = me;
     out->slots[out->tail % CAP].done_flag = 0;
     out->slots[out->tail % CAP].idx       = pkt.idx;
-    out->slots[out->tail % CAP].value     = me * 1000000 + pkt.value;
+    out->slots[out->tail % CAP].value     = tbl[(size_t)me * TABLE_SIZE + (uint32_t)pkt.value];
     vx_fence();
     out->tail = out->tail + 1;
     return 1;
@@ -92,6 +93,7 @@ static inline uint32_t mix(uint32_t a, uint32_t b) {
 void kernel_body(args_t* __UNIFORM__ a) {
     ring_t* mb0 = (ring_t*)a->mb0_grid_addr;
     ring_t* mb1 = (ring_t*)a->mb1_grid_addr;
+    int*    tbl = (int*)a->table_addr;
     int*    tgt = (int*)a->tgt_addr;
     int     N   = a->N;
     // role + actor id from the physical warp (first half of a core's warps = main,
@@ -111,11 +113,11 @@ void kernel_body(args_t* __UNIFORM__ a) {
         uint64_t s0 = csr_read(VX_CSR_MCYCLE);
         for (uint32_t i = 0; i < M; i++) {
             int dst  = (int)(mix(me, 2u*i + 1u) % (uint32_t)N);
-            int lidx = (int)(mix(me, 2u*i + 2u) % 1000u);
-            send_req(mb0, N, dst, me, /*idx=*/(int)i, /*val=*/lidx);
+            int lidx = (int)(mix(me, 2u*i + 2u) % (uint32_t)TABLE_SIZE);
+            send_data(mb0, N, dst, me, /*idx=*/(int)i, /*val=*/lidx);
         }
         uint64_t s1 = csr_read(VX_CSR_MCYCLE);
-        broadcast_done_blk(mb0, N, me);
+        broadcast_done(mb0, N, me);
         uint64_t s2 = csr_read(VX_CSR_MCYCLE);
         ph->send_data = s1 - s0;
         ph->send_done = s2 - s1;          // mb0 done (mb1 done added by recv below)
@@ -131,7 +133,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
             uint64_t q0 = csr_read(VX_CSR_MCYCLE);
             int hit_req = 0;
             for (int src = 0; src < N; src++) {
-                if (service_one(mb0, mb1, N, me, src, &mb0_dones)) hit_req = 1;
+                if (service_one(mb0, mb1, tbl, N, me, src, &mb0_dones)) hit_req = 1;
             }
             uint64_t q1 = csr_read(VX_CSR_MCYCLE);
             if (hit_req) { c_hreq += q1 - q0; last_work = q1; }
@@ -153,7 +155,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
                 if (try_recv(mb1, N, me, src, &pkt)) {
                     hit_rep = 1;
                     if (pkt.done_flag == 1) mb1_dones++;
-                    else                    tgt[me * M + pkt.idx] = pkt.value;
+                    else                    tgt[TGT_IDX(me, pkt.idx, N)] = pkt.value;
                 }
             }
             uint64_t p1 = csr_read(VX_CSR_MCYCLE);

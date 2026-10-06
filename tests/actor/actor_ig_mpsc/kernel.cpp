@@ -46,6 +46,7 @@ static inline uint32_t mix(uint32_t a, uint32_t b) {
 void kernel_body(args_t* __UNIFORM__ a) {
     inbox_t* mb0 = (inbox_t*)a->mb0_addr;
     inbox_t* mb1 = (inbox_t*)a->mb1_addr;
+    int*     tbl = (int*)a->table_addr;
     int*     tgt = (int*)a->tgt_addr;
     int      N   = a->N;
     int      me  = blockIdx.x;
@@ -74,7 +75,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
             if (df == 1) { mpsc_pop(mb0me); mb0_dones++; worked = 1; }
             else if (!rp) {
                 rp_pos = (uint32_t)__atomic_fetch_add(&mb1[sn].tail, 1, __ATOMIC_RELAXED);
-                rp_in = &mb1[sn]; rp_idx = ix; rp_val = me * 1000000 + vl; rp = 1;
+                rp_in = &mb1[sn]; rp_idx = ix; rp_val = tbl[(size_t)me * TABLE_SIZE + (uint32_t)vl]; rp = 1;
                 mpsc_pop(mb0me);                          // commit: consume request
                 worked = 1;
             }
@@ -89,7 +90,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
             if (req_sent < (int)M) {
                 int i = req_sent;
                 int dst  = (int)(mix(me, 2u*(uint32_t)i + 1u) % (uint32_t)N);
-                int lidx = (int)(mix(me, 2u*(uint32_t)i + 2u) % 1000u);
+                int lidx = (int)(mix(me, 2u*(uint32_t)i + 2u) % (uint32_t)TABLE_SIZE);
                 rq_pos = (uint32_t)__atomic_fetch_add(&mb0[dst].tail, 1, __ATOMIC_RELAXED);
                 rq_in = &mb0[dst]; rq_type = PT_REQ; rq_done = 0; rq_idx = i; rq_val = lidx;
                 rq = 1; req_sent = i + 1; worked = 1;
@@ -111,7 +112,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
         uint64_t r0 = csr_read(VX_CSR_MCYCLE);
         while (mpsc_peek(mb1me, &df, &sn, &ix, &vl)) {
             if (df == 1) mb1_dones++;
-            else         tgt[me * M + ix] = vl;
+            else         tgt[TGT_IDX(me, ix, N)] = vl;
             mpsc_pop(mb1me); worked = 1;
         }
         uint64_t r1 = csr_read(VX_CSR_MCYCLE);

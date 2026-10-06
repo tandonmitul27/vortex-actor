@@ -3,7 +3,7 @@ include $(ROOT_DIR)/config.mk
 
 PROJECT := baseline_ig
 
-SRC_DIR := $(VORTEX_HOME)/tests/regression/$(PROJECT)
+SRC_DIR := $(VORTEX_HOME)/tests/actor/$(PROJECT)
 
 SRCS := $(SRC_DIR)/main.cpp
 

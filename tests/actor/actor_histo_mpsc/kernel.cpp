@@ -49,6 +49,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
     uint32_t p_pos = 0; inbox_t* p_in = 0;
     int p_done = 0, p_bucket = 0;
 
+    uint64_t c_ticket = 0, c_publish = 0;
     uint64_t c_sd = 0, c_sn = 0, c_h = 0, c_e = 0;
     uint64_t t0 = csr_read(VX_CSR_MCYCLE);
     uint64_t last_work = t0;
@@ -68,10 +69,13 @@ void kernel_body(args_t* __UNIFORM__ a) {
                 p_done = 1; p_bucket = 0;
             }
             p_in = &inbox[dst];
+            uint64_t k0 = csr_read(VX_CSR_MCYCLE);
             p_pos = (uint32_t)__atomic_fetch_add(&p_in->tail, 1, __ATOMIC_RELAXED);
+            c_ticket += csr_read(VX_CSR_MCYCLE) - k0;   // BREAKDOWN: ticket alloc
             pending = 1; doing_send = 1;
         }
         if (pending) {                              // publish if my slot is free
+            uint64_t q0 = csr_read(VX_CSR_MCYCLE);
             slot_t* s = &p_in->slots[p_pos % CAP];
             if (s->seq == p_pos) {
                 s->sender    = me;
@@ -82,6 +86,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
                 pending = 0; send_idx++;
                 last_work = csr_read(VX_CSR_MCYCLE);
             }
+            c_publish += csr_read(VX_CSR_MCYCLE) - q0;  // BREAKDOWN: publish+spin
             doing_send = 1;
         }
         uint64_t s1 = csr_read(VX_CSR_MCYCLE);
@@ -105,6 +110,8 @@ void kernel_body(args_t* __UNIFORM__ a) {
     uint64_t ep = c_e > tail ? c_e - tail : 0;
     phase_cycles_t* ph = &((phase_cycles_t*)a->phase_addr)[me];
     ph->send_data  = c_sd;
+    ph->bd_ticket  = c_ticket;
+    ph->bd_publish = c_publish;
     ph->send_done  = c_sn;
     ph->handle_req = 0;
     ph->handle_rep = c_h;

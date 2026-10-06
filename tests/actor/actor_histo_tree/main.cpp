@@ -2,6 +2,8 @@
 // replay, print the per-PE phase cycle breakdown. Allocates the two barrier flag
 // arrays (arrived[], released[]) in addition to the SPSC grid.
 
+#include <algorithm>
+#include <vector>
 #include <iostream>
 #include <vector>
 #include <vortex.h>
@@ -60,6 +62,20 @@ int main(int argc, char** argv) {
     std::vector<char> zf(flag_bytes, 0);
     vx_copy_to_dev(arr_buf, zf.data(), 0, flag_bytes);
     vx_copy_to_dev(rel_buf, zf.data(), 0, flag_bytes);
+
+    // No actor drains a buffer while it is still sending, so a buffer that can
+    // fill can hang the run. Replay the hash and warn before launch.
+    {
+        std::vector<uint32_t> load((size_t)N * N, 0);
+        uint32_t worst = 0;
+        for (uint32_t s = 0; s < N; s++)
+            for (uint32_t i = 0; i < (uint32_t)M; i++)
+                worst = std::max(worst, ++load[(size_t)s * N + (mix(s, i) % (uint32_t)(L * N)) % N]);
+        if (worst > (uint32_t)CAP) {
+            std::cerr << "warning: CAP=" << CAP << " is below the worst buffer load of "
+                      << worst << " messages (data), so the run can hang. Use a larger CAP.\n";
+        }
+    }
 
     vx_upload_kernel_file(dev, "kernel.vxbin", &kernel_buf);
     vx_upload_bytes(dev, &args, sizeof(args), &args_buf);

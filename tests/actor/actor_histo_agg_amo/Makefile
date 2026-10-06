@@ -1,7 +1,7 @@
 ROOT_DIR := $(realpath ../../..)
 include $(ROOT_DIR)/config.mk
 
-PROJECT := baseline_histo
+PROJECT := actor_histo_agg_amo
 
 SRC_DIR := $(VORTEX_HOME)/tests/actor/$(PROJECT)
 
@@ -9,6 +9,6 @@ SRCS := $(SRC_DIR)/main.cpp
 
 VX_SRCS := $(SRC_DIR)/kernel.cpp
 
-OPTS ?= -m32
+OPTS ?=
 
 include ../common.mk

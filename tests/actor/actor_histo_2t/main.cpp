@@ -26,6 +26,12 @@ int main(int argc, char** argv) {
     vx_dev_caps(dev, VX_CAPS_NUM_CORES,   &cores);
     vx_dev_caps(dev, VX_CAPS_NUM_WARPS,   &warps);
     vx_dev_caps(dev, VX_CAPS_NUM_THREADS, &threads);
+    // Roles come from the physical warp id: the first half of a core's warps send,
+    // the second half receive. An odd warp count would leave no senders and hang.
+    if (warps < 2 || warps % 2 != 0) {
+        std::cerr << "error: needs an even number of warps per core (got " << warps << ")\n";
+        return 1;
+    }
     // 2 hardware threads per actor (main + recv), so N actors use 2N lanes
     uint32_t N = (uint32_t)(cores * warps * threads) / 2;
 

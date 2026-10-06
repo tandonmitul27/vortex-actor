@@ -67,7 +67,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
         }
         uint64_t s1 = csr_read(VX_CSR_MCYCLE);
 
-        int phase = 0;  // 0 = wait children, 1 = released+propagated
+        int phase = 0;  // 0 = wait children, 1 = wait release, 2 = done
         while (!vx_vote_all(phase == 2)) {
             if (phase == 0) {
                 if ((!haveL || arrived[Lc]) && (!haveR || arrived[Rc])) {

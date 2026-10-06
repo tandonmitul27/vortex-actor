@@ -6,7 +6,9 @@
 #ifndef CAP
 #define CAP   16    // ring capacity (power of 2)
 #endif
+#ifndef L
 #define L     10    // local buckets per PE (total = L * N)
+#endif
 #ifndef M
 #define M     10    // updates per PE
 #endif

@@ -39,7 +39,9 @@ typedef struct {
     uint64_t handle_rep;  // recv bump + counts++ (O(1) per msg, no scan)
     uint64_t empty_poll;  // empty inbox checks before the last packet
     uint64_t tail_wait;   // idle after the last packet
-    uint64_t total;       // full kernel_body span
+    uint64_t total;
+    uint64_t bd_ticket;   // atomic fetch-add for a slot ticket
+    uint64_t bd_publish;  // write the slot + spin until the consumer frees it       // full kernel_body span
 } phase_cycles_t;
 
 typedef struct {

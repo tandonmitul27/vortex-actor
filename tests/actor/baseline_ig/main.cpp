@@ -3,8 +3,12 @@
 
 #include <iostream>
 #include <vector>
+#include <algorithm>
 #include <vortex.h>
 #include "common.h"
+#ifndef SPLIT
+#define SPLIT 1
+#endif
 
 // must match the device-side mix() exactly
 static inline uint32_t mix(uint32_t a, uint32_t b) {
@@ -30,7 +34,7 @@ int main(int argc, char** argv) {
     vx_dev_caps(dev, VX_CAPS_NUM_WARPS,   &warps);
     vx_dev_caps(dev, VX_CAPS_NUM_THREADS, &threads);
     uint32_t hw_lanes = (uint32_t)(cores * warps * threads);
-    uint32_t N = (N_arg > 0) ? (uint32_t)N_arg : hw_lanes;
+    uint32_t N = (N_arg > 0) ? (uint32_t)N_arg : hw_lanes / (uint32_t)(SPLIT);   // SPLIT, log T41
 
     std::cout << "N=" << N << " threads, M=" << M
               << " requests/PE, table=" << TABLE_SIZE
@@ -39,13 +43,16 @@ int main(int argc, char** argv) {
     size_t table_bytes = (size_t)N * TABLE_SIZE * sizeof(int);
     size_t tgt_bytes   = (size_t)N * M * sizeof(int);
 
-    vx_buffer_h table_buf, tgt_buf, kernel_buf, args_buf;
+    vx_buffer_h table_buf, tgt_buf, kernel_buf, args_buf, phase_buf;
     vx_mem_alloc(dev, table_bytes, VX_MEM_READ_WRITE, &table_buf);
     vx_mem_alloc(dev, tgt_bytes,   VX_MEM_READ_WRITE, &tgt_buf);
+    size_t phase_bytes = (size_t)N * sizeof(phase_cycles_t);
+    vx_mem_alloc(dev, phase_bytes, VX_MEM_READ_WRITE, &phase_buf);
 
     args_t args;
     vx_mem_address(table_buf, &args.table_addr);
     vx_mem_address(tgt_buf,   &args.tgt_addr);
+    vx_mem_address(phase_buf, &args.phase_addr);
     args.N = N;
 
     // table[pe*TABLE_SIZE + lidx] = pe*1e6 + lidx  (so the host knows every value)
@@ -67,6 +74,13 @@ int main(int argc, char** argv) {
 
     std::vector<int> tgt(N * M);
     vx_copy_from_dev(tgt.data(), tgt_buf, 0, tgt_bytes);
+    {   // the launch-free body window (T42), as the actor kernels report it
+        std::vector<phase_cycles_t> ph(N);
+        vx_copy_from_dev(ph.data(), phase_buf, 0, phase_bytes);
+        uint64_t s0 = ~0ull, e1 = 0;
+        for (uint32_t i = 0; i < N; i++) { s0 = std::min(s0, ph[i].t_start); e1 = std::max(e1, ph[i].t_end); }
+        std::cout << "span (absolute core cycles): first start=" << s0 << " last end=" << e1 << "\n";
+    }
 
     // expected output: replay the same RNG on the host
     std::vector<int> expected(N * M, 0);
@@ -81,7 +95,7 @@ int main(int argc, char** argv) {
     int mismatches = 0;
     for (uint32_t me = 0; me < N; me++) {
         for (uint32_t i = 0; i < M; i++) {
-            int actual = tgt[me * M + i];
+            int actual = tgt[TGT_IDX(me, i, N)];
             int exp    = expected[me * M + i];
             if (actual != exp) {
                 if (mismatches < 8) {
@@ -99,6 +113,7 @@ int main(int argc, char** argv) {
 
     vx_mem_free(table_buf);
     vx_mem_free(tgt_buf);
+    vx_mem_free(phase_buf);
     vx_mem_free(kernel_buf);
     vx_mem_free(args_buf);
     vx_dev_close(dev);

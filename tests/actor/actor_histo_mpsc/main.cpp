@@ -44,6 +44,10 @@ int main(int argc, char** argv) {
 
     args_t args;
     vx_mem_address(inbox_buf,  &args.inbox_addr);
+    // Report the inbox window so it can be mapped to the modeled on-chip message
+    // memory (VORTEX_MSGMEM_BASE / VORTEX_MSGMEM_SIZE) on a second run.
+    std::cout << "MSGWINDOW base=0x" << std::hex << args.inbox_addr << std::dec
+              << " size=" << inbox_bytes << "\n";
     vx_mem_address(counts_buf, &args.counts_addr);
     vx_mem_address(phase_buf,  &args.phase_addr);
     args.N = N;
@@ -106,6 +110,11 @@ int main(int argc, char** argv) {
     // ---- phase breakdown ----
     std::vector<phase_cycles_t> ph(N);
     vx_copy_from_dev(ph.data(), phase_buf, 0, phase_bytes);
+    {   uint64_t tk=0, pb=0;
+        for (uint32_t i = 0; i < N; i++) { tk += ph[i].bd_ticket; pb += ph[i].bd_publish; }
+        std::cout << "ENQUEUE ticket=" << tk/N << " publish_spin=" << pb/N << "\n";
+    }
+
 
     uint64_t sum_send_data=0, sum_send_done=0, sum_hreq=0, sum_hrep=0, sum_empty=0, sum_tail=0, sum_span=0;
     uint64_t max_send_data=0, max_send_done=0, max_hreq=0, max_hrep=0, max_empty=0, max_tail=0;

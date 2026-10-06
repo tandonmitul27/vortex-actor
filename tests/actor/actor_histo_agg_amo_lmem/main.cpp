@@ -1,9 +1,7 @@
-// actor_histo_tree host: launch the tree-barrier kernel, verify via host RNG
-// replay, print the per-PE phase cycle breakdown. Allocates the two barrier flag
-// arrays (arrived[], released[]) in addition to the SPSC grid.
+// Host for the two-level LMEM histogram (int slots + amoadd). Same as
+// actor_histo_agg_lmem's host, but msg_t is int[L], so the per-core LMEM grid is 4x
+// larger and the fit check below rejects configs where P*P*L*4 exceeds the LMEM.
 
-#include <algorithm>
-#include <vector>
 #include <iostream>
 #include <vector>
 #include <vortex.h>
@@ -23,38 +21,48 @@ int main(int argc, char** argv) {
     vx_device_h dev;
     if (vx_dev_open(&dev) != 0) { std::cerr << "vx_dev_open failed\n"; return 1; }
 
-    uint64_t cores, warps, threads;
+    uint64_t cores, warps, threads, lmem_size;
     vx_dev_caps(dev, VX_CAPS_NUM_CORES,   &cores);
     vx_dev_caps(dev, VX_CAPS_NUM_WARPS,   &warps);
     vx_dev_caps(dev, VX_CAPS_NUM_THREADS, &threads);
+    vx_dev_caps(dev, VX_CAPS_LOCAL_MEM_SIZE, &lmem_size);
     uint32_t N = (uint32_t)(cores * warps * threads);
+    uint32_t P = (uint32_t)(warps * threads);          // actors per core (block size)
+    size_t lmem_need = (size_t)P * P * sizeof(msg_t);  // per-core LMEM grid
 
     std::cout << "N=" << N << " actors, L=" << L << " buckets/PE, M=" << M
-              << " updates/PE (Bale histogram, tree-barrier termination, "
+              << " updates/PE (Bale histogram, two-level LMEM, "
               << (L * N) << " total buckets)\n";
+    std::cout << "layout: " << cores << " cores x " << P << " actors/core; "
+              << "per-core LMEM grid = " << lmem_need << " B of " << lmem_size << " B\n";
+    if (lmem_need > lmem_size) {
+        std::cerr << "error: per-core LMEM grid (" << lmem_need << " B) exceeds LMEM ("
+                  << lmem_size << " B); reduce actors/core or L\n";
+        vx_dev_close(dev);
+        return 1;
+    }
 
-    size_t grid_bytes   = (size_t)N * N * sizeof(ring_t);
+    size_t msg_bytes    = (size_t)N * N * sizeof(msg_t);        // global message grid
     size_t counts_bytes = (size_t)N * L * sizeof(int);
     size_t phase_bytes  = (size_t)N * sizeof(phase_cycles_t);
     size_t flag_bytes   = (size_t)N * sizeof(uint32_t);
 
-    vx_buffer_h grid_buf, counts_buf, phase_buf, arr_buf, rel_buf, kernel_buf, args_buf;
-    vx_mem_alloc(dev, grid_bytes,   VX_MEM_READ_WRITE, &grid_buf);
+    vx_buffer_h msg_buf, counts_buf, phase_buf, arr_buf, rel_buf, kernel_buf, args_buf;
+    vx_mem_alloc(dev, msg_bytes,    VX_MEM_READ_WRITE, &msg_buf);
     vx_mem_alloc(dev, counts_bytes, VX_MEM_READ_WRITE, &counts_buf);
     vx_mem_alloc(dev, phase_bytes,  VX_MEM_READ_WRITE, &phase_buf);
     vx_mem_alloc(dev, flag_bytes,   VX_MEM_READ_WRITE, &arr_buf);
     vx_mem_alloc(dev, flag_bytes,   VX_MEM_READ_WRITE, &rel_buf);
 
     args_t args;
-    vx_mem_address(grid_buf,   &args.grid_addr);
+    vx_mem_address(msg_buf,    &args.msg_addr);
     vx_mem_address(counts_buf, &args.counts_addr);
     vx_mem_address(phase_buf,  &args.phase_addr);
     vx_mem_address(arr_buf,    &args.arrived_addr);
     vx_mem_address(rel_buf,    &args.released_addr);
     args.N = N;
 
-    std::vector<char> zg(grid_bytes, 0);
-    vx_copy_to_dev(grid_buf, zg.data(), 0, grid_bytes);
+    { std::vector<char> zm(msg_bytes, 0); vx_copy_to_dev(msg_buf, zm.data(), 0, msg_bytes); }
     std::vector<char> zc(counts_bytes, 0);
     vx_copy_to_dev(counts_buf, zc.data(), 0, counts_bytes);
     std::vector<char> zp(phase_bytes, 0);
@@ -62,20 +70,6 @@ int main(int argc, char** argv) {
     std::vector<char> zf(flag_bytes, 0);
     vx_copy_to_dev(arr_buf, zf.data(), 0, flag_bytes);
     vx_copy_to_dev(rel_buf, zf.data(), 0, flag_bytes);
-
-    // No actor drains a buffer while it is still sending, so a buffer that can
-    // fill can hang the run. Replay the hash and warn before launch.
-    {
-        std::vector<uint32_t> load((size_t)N * N, 0);
-        uint32_t worst = 0;
-        for (uint32_t s = 0; s < N; s++)
-            for (uint32_t i = 0; i < (uint32_t)M; i++)
-                worst = std::max(worst, ++load[(size_t)s * N + (mix(s, i) % (uint32_t)(L * N)) % N]);
-        if (worst > (uint32_t)CAP) {
-            std::cerr << "warning: CAP=" << CAP << " is below the worst buffer load of "
-                      << worst << " messages (data), so the run can hang. Use a larger CAP.\n";
-        }
-    }
 
     vx_upload_kernel_file(dev, "kernel.vxbin", &kernel_buf);
     vx_upload_bytes(dev, &args, sizeof(args), &args_buf);
@@ -140,12 +134,24 @@ int main(int argc, char** argv) {
     std::cout << "  handle_rep: mean=" << (uint64_t)p(sum_hrep) << "  max=" << max_hrep << "  (" << pct(sum_hrep) << "%)\n";
     std::cout << "  empty_poll: mean=" << (uint64_t)p(sum_empty) << "  max=" << max_empty << "  (" << pct(sum_empty) << "%)\n";
     std::cout << "  tail_wait:  mean=" << (uint64_t)p(sum_tail) << "  max=" << max_tail << "  (" << pct(sum_tail) << "%)\n";
+    {   // machine-readable fine-grained breakdown (mean cycles per PE)
+        uint64_t a_on = 0, a_off = 0, d_on = 0, d_off = 0;
+        for (uint32_t i = 0; i < N; i++) {
+            a_on += ph[i].bd_acc_on;   a_off += ph[i].bd_acc_off;
+            d_on += ph[i].bd_drain_on; d_off += ph[i].bd_drain_off;
+        }
+        std::cout << "BREAKDOWN acc_on=" << a_on / N << " acc_off=" << a_off / N
+                  << " drain_on=" << d_on / N << " drain_off=" << d_off / N
+                  << " send_data=" << (uint64_t)p(sum_send_data)
+                  << " barrier=" << (uint64_t)p(sum_send_done)
+                  << " span=" << mean_span << "\n";
+    }
     std::cout << "  mean_total: " << mean_total << "\n";
     std::cout << "  mean_span:  " << mean_span << "\n";
     std::cout << "  other:      " << (mean_span > mean_total ? mean_span - mean_total : 0)
               << "  (unmeasured vote_all/loop overhead)\n";
 
-    vx_mem_free(grid_buf);  vx_mem_free(counts_buf); vx_mem_free(phase_buf);
+    vx_mem_free(msg_buf);  vx_mem_free(counts_buf); vx_mem_free(phase_buf);
     vx_mem_free(arr_buf);   vx_mem_free(rel_buf);
     vx_mem_free(kernel_buf); vx_mem_free(args_buf);
     vx_dev_close(dev);

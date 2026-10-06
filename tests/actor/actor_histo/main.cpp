@@ -1,7 +1,10 @@
 // actor_histo host: launch the kernel, verify via host RNG replay, print the
 // per-PE phase cycle breakdown.
 
+#include <algorithm>
+#include <vector>
 #include <iostream>
+#include <string>
 #include <vector>
 #include <vortex.h>
 #include "common.h"
@@ -26,7 +29,14 @@ int main(int argc, char** argv) {
     vx_dev_caps(dev, VX_CAPS_NUM_CORES,   &cores);
     vx_dev_caps(dev, VX_CAPS_NUM_WARPS,   &warps);
     vx_dev_caps(dev, VX_CAPS_NUM_THREADS, &threads);
-    uint32_t N = (uint32_t)(cores * warps * threads);
+    // Optional -n N: override the actor count (defaults to total HW lanes).
+    // Without this the N axis of any sweep is silently void: the host prints and
+    // uses the derived lane count whatever -n says.
+    int N_arg = 0;
+    for (int i = 1; i + 1 < argc; i++)
+        if (std::string(argv[i]) == "-n") N_arg = atoi(argv[i + 1]);
+    uint32_t hw_lanes = (uint32_t)(cores * warps * threads);
+    uint32_t N = (N_arg > 0) ? (uint32_t)N_arg : hw_lanes;
 
     std::cout << "N=" << N << " actors, L=" << L << " buckets/PE, M=" << M
               << " updates/PE (Bale-style histogram, " << (L * N) << " total buckets)\n";
@@ -52,6 +62,20 @@ int main(int argc, char** argv) {
     vx_copy_to_dev(counts_buf, zc.data(), 0, counts_bytes);
     std::vector<char> zp(phase_bytes, 0);
     vx_copy_to_dev(phase_buf, zp.data(), 0, phase_bytes);
+
+    // No actor drains a buffer while it is still sending, so a buffer that can
+    // fill can hang the run. Replay the hash and warn before launch.
+    {
+        std::vector<uint32_t> load((size_t)N * N, 0);
+        uint32_t worst = 0;
+        for (uint32_t s = 0; s < N; s++)
+            for (uint32_t i = 0; i < (uint32_t)M; i++)
+                worst = std::max(worst, ++load[(size_t)s * N + (mix(s, i) % (uint32_t)(L * N)) % N]);
+        if (worst + 1 > (uint32_t)CAP) {
+            std::cerr << "warning: CAP=" << CAP << " is below the worst buffer load of "
+                      << worst + 1 << " messages (data + done), so the run can hang. Use a larger CAP.\n";
+        }
+    }
 
     vx_upload_kernel_file(dev, "kernel.vxbin", &kernel_buf);
     vx_upload_bytes(dev, &args, sizeof(args), &args_buf);
