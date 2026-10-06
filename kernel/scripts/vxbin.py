@@ -75,7 +75,9 @@ def create_vxbin_binary(input_elf, output_bin, objcopy_path):
     max_vma = max(max_vma, end)
 
     # Create a binary data from the ELF file using objcopy
-    temp_bin_path = '/tmp/temp_kernel.bin'
+    # Unique per invocation: a fixed /tmp name made concurrent kernel builds
+    # clobber each other, so parallel sweeps had to serialise every build.
+    temp_bin_path = '{}.{}.tmpbin'.format(output_bin, os.getpid())
     subprocess.check_call([objcopy_path, '-O', 'binary', input_elf, temp_bin_path])
 
     # Read the binary file to determine its size
