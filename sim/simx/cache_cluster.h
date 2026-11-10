@@ -87,6 +87,10 @@ public:
 
 	void tick() {}
 
+	void invalidate_all() {
+		for (auto cache : caches_) cache->invalidate_all();
+	}
+
 	CacheSim::PerfStats perf_stats() const {
 		CacheSim::PerfStats perf;
 		for (auto cache : caches_) {

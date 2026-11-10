@@ -74,9 +74,15 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
   // set up memory profiling
   for (uint32_t i = 0; i < L3_MEM_PORTS; ++i) {
     memsim_->MemReqPorts.at(i).tx_callback([&](const MemReq& req, uint64_t cycle){
-      __unused (cycle);
       perf_mem_reads_  += !req.write;
       perf_mem_writes_ += req.write;
+      // diagnostic: VORTEX_MEM_SAMPLE=<cycles> prints cumulative DRAM reads/writes over time
+      static const uint64_t mem_sample = getenv("VORTEX_MEM_SAMPLE") ? strtoull(getenv("VORTEX_MEM_SAMPLE"), nullptr, 0) : 0;
+      static uint64_t mem_next = 0;
+      if (mem_sample && cycle >= mem_next) {
+        printf("MEMS %lu %lu %lu\n", (unsigned long)cycle, (unsigned long)perf_mem_reads_, (unsigned long)perf_mem_writes_);
+        mem_next = (cycle / mem_sample + 1) * mem_sample;
+      }
       perf_mem_pending_reads_ += !req.write;
     });
     memsim_->MemRspPorts.at(i).tx_callback([&](const MemRsp&, uint64_t cycle){

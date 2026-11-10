@@ -78,11 +78,13 @@ Core::Core(const SimContext& ctx,
     log2ceil(LMEM_NUM_BANKS),
     false
   });
+  // expose this core's LMEM to the remote-push path (AddrType::RemoteLmem)
+  rpush_register(core_id, local_mem_.get());
 
   // create lmem switch
   for (uint32_t b = 0; b < NUM_LSU_BLOCKS; ++b) {
     snprintf(sname, 100, "%s-lmem_switch%d", this->name().c_str(), b);
-    lmem_switch_.at(b) = LocalMemSwitch::Create(sname, 1);
+    lmem_switch_.at(b) = LocalMemSwitch::Create(sname, 1, core_id);
   }
 
   // create dcache adapter
@@ -427,7 +429,16 @@ void Core::commit() {
       }
     }
 
-    // delete the trace
+    // delete the trace.
+    //
+    // The trace is constructed with PLACEMENT NEW into a pool (execute.cpp and
+    // dispatcher.cpp), but MemoryPool::deallocate only relinks the block or
+    // calls raw ::operator delete -- it never runs the destructor. instr_trace_t
+    // owns a std::vector<RegOpd> and an ITraceData::Ptr (a shared_ptr to
+    // LsuTraceData for every memory instruction), so without this call both leak
+    // once per executed instruction. That grew host RSS linearly with simulated
+    // time and OOM-killed the long-running polling kernels at 18-21 GB.
+    trace->~instr_trace_t();
     trace_pool_.deallocate(trace, 1);
 
     commit_arb->Outputs.at(0).pop();

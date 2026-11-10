@@ -3,3 +3,11 @@
 *.cache
 *.code-workspace
 miscs/apptainer/vortex.sif
+
+# actor work: local source backups, step copies, kernel dumps, graph inputs
+*.pre_*
+*.bak
+tests/actor/**/*.v[0-9]*
+tests/actor/**/*.step*
+tests/actor/_dump_*/
+tests/actor/*/graphs/

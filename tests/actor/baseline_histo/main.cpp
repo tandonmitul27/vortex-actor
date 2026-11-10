@@ -6,6 +6,7 @@
 #include <vector>
 #include <vortex.h>
 #include "common.h"
+#include "../skew.h"
 #ifndef SPLIT
 #define SPLIT 1
 #endif
@@ -72,7 +73,7 @@ int main(int argc, char** argv) {
     uint32_t G_total = L * N;
     for (uint32_t me = 0; me < N; me++) {
         for (uint32_t i = 0; i < M; i++) {
-            uint32_t g = mix(me, i) % G_total;
+            uint32_t g = skew_key(mix(me, i), G_total);
             expected[g]++;
         }
     }

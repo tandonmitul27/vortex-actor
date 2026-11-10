@@ -108,6 +108,10 @@ public:
 
   void dcache_read(void* data, uint64_t addr, uint32_t size);
 
+  void aq_write(const void* data, uint64_t addr, uint32_t size);
+  void aq_append(uint32_t q, const void* data, uint32_t size);   // ISA2 append instruction (and the legacy window)
+  uint32_t aq_count(uint32_t q);                                 // ISA2 count instruction
+  void ap_write(const void* data, uint64_t addr, uint32_t size);   // apply engine command
   void dcache_write(const void* data, uint64_t addr, uint32_t size);
 
   // Get warp by index (for debug module access)

@@ -19,6 +19,8 @@
 #include <util.h>
 
 #include "emulator.h"
+#include <cstring>
+#include <algorithm>
 #include "instr_trace.h"
 #include "instr.h"
 #include "dcrs.h"
@@ -362,6 +364,13 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
   auto type = get_addr_type(addr);
   if (type == AddrType::Shared) {
     core_->local_mem()->read(data, addr, size);
+  } else if (type == AddrType::RemoteLmem) {
+    rpush_lookup(rpush_core(addr))->read(data, addr, size);
+  } else if (type == AddrType::AppendQ) {
+    memset(data, 0, size);   // the window is write only; queues are read at qbase
+    if (ap_is_window(addr) && ap_line(addr) == AP_DONE_LINE && size >= 4) {
+      uint32_t d = ap_done(core_->id()); memcpy(data, &d, 4);
+    }
   } else {
     try
     {
@@ -380,6 +389,15 @@ void Emulator::dcache_read(void *data, uint64_t addr, uint32_t size) {
   auto type = get_addr_type(addr);
   if (type == AddrType::Shared) {
     core_->local_mem()->read(data, addr, size);
+  } else if (type == AddrType::RemoteLmem) {
+    // debug-only: the push model treats the window as write-only, but reads
+    // resolve to the destination scratchpad so verification kernels can peek.
+    rpush_lookup(rpush_core(addr))->read(data, addr, size);
+  } else if (type == AddrType::AppendQ) {
+    memset(data, 0, size);   // the window is write only; queues are read at qbase
+    if (ap_is_window(addr) && ap_line(addr) == AP_DONE_LINE && size >= 4) {
+      uint32_t d = ap_done(core_->id()); memcpy(data, &d, 4);
+    }
   } else {
     mmu_.read(data, addr, size, 0);
   }
@@ -397,6 +415,10 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
   } else {
     if (type == AddrType::Shared) {
       core_->local_mem()->write(data, addr, size);
+    } else if (type == AddrType::RemoteLmem) {
+      rpush_lookup(rpush_core(addr))->write(data, addr, size);
+    } else if (type == AddrType::AppendQ) {
+      this->aq_write(data, addr, size);
     } else {
       try
       {
@@ -421,6 +443,13 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
   } else {
     if (type == AddrType::Shared) {
       core_->local_mem()->write(data, addr, size);
+    } else if (type == AddrType::RemoteLmem) {
+      // remote push: deposit directly into the DESTINATION core's scratchpad
+      // (LocalMem masks the address to its capacity, so the in-window offset
+      // maps onto the same LMEM locations the destination reads as Shared).
+      rpush_lookup(rpush_core(addr))->write(data, addr, size);
+    } else if (type == AddrType::AppendQ) {
+      this->aq_write(data, addr, size);
     } else {
       mmu_.write(data, addr, size, 0);
     }
@@ -429,16 +458,212 @@ void Emulator::dcache_write(const void* data, uint64_t addr, uint32_t size) {
 }
 #endif
 
+// Combining append queue, functional side (see types.h). A store into the
+// control line sets the queue geometry; the tails reset when the geometry
+// CHANGES, so every block may write the same control block and only the
+// first completion resets. A store into line q+1 appends one word to queue q.
+void Emulator::aq_write(const void* data, uint64_t addr, uint32_t size) {
+  if (ap_is_window(addr)) { this->ap_write(data, addr, size); return; }
+  int64_t q = aq_queue(addr);
+  if (q < 0) {
+    uint64_t off = addr - g_aq_base;
+    if (off == AQ_FLUSH_OFF) { aq_tail_flush(); return; }   // end of an append round
+    if (off == AQ_POOL_OFF && size == 8) {
+      uint64_t v; memcpy(&v, data, 8);
+      uint64_t fld = v >> 60, val = v & ((1ull << 60) - 1);
+      if (fld == 1) { if (val != g_aq_pool.base) { g_aq_pool.base = val; g_aq_pool.next = 0; } }   // repeated writes by every thread must not hand chunks out twice
+      else if (fld == 2) g_aq_pool.ctab = val;
+      else if (fld == 3) { g_aq_pool.ch = val >> 32; g_aq_pool.maxc = val & 0xffffffffull; }
+      else if (fld == 4) g_aq_pool.nch = val;
+      return;
+    }
+    if (off == AQ_ROUND_OFF) {
+      // END OF ROUND (P3). Flush the partial lines, then empty every queue: the
+      // next chunk refills the same storage from the start. This is what turns
+      // the queue from a buffer sized for the whole run into a small one reused
+      // K times, which is the only thing that can bound the live footprint.
+      // Only queues that hold something are touched.
+      aq_tail_flush();
+      { uint64_t used = 0, mx = 0;
+        for (auto f : g_aq_fill) { used += (f != 0); if (f > mx) mx = f; }
+        if (used > g_aq_used_hw) g_aq_used_hw = used;
+        if (mx > g_aq_maxfill_hw) g_aq_maxfill_hw = mx; }
+      uint32_t z = 0;
+      for (size_t q = 0; q < g_aq_tail.size(); ++q) {
+        if (g_aq_tail[q] == 0) continue;
+        g_aq_tail[q] = 0;
+        if (isa2_on()) continue;   // ISA2: no tails array in memory
+#ifdef VM_ENABLE
+        mmu_.write(&z, g_aq_ctrl.tailbase + 4 * (uint64_t)q, 4, ACCESS_TYPE::STORE);
+#else
+        mmu_.write(&z, g_aq_ctrl.tailbase + 4 * (uint64_t)q, 4, 0);
+#endif
+      }
+      std::fill(g_aq_fill.begin(), g_aq_fill.end(), 0u);
+      std::fill(g_aq_flushed.begin(), g_aq_flushed.end(), 0u);
+      aq_reopen_clear();
+      g_aq_ovf.clear(); g_aq_pool.next = 0;   // the round's overflow chunks are drained too: reuse the pool
+      return;
+    }
+    if (off + size > sizeof(AqCtrl)) return;
+    AqCtrl nc = g_aq_ctrl;
+    memcpy(reinterpret_cast<char*>(&nc) + off, data, size);
+    if (memcmp(&nc, &g_aq_ctrl, sizeof(AqCtrl)) != 0) {
+      if (isa2_on() && aq_set_on() && off == 32 && nc.qstride != 0 && (nc.qstride % AQ_LINE) != 0) {
+        // ISA2: the program lays queues out line by line; a stride that is not whole lines has no such layout
+        fprintf(stderr, "ISA2 VIOLATION: queue stride %llu is not whole lines\n", (unsigned long long)nc.qstride);
+        std::abort();
+      }
+      aq_tail_flush();                                        // the old geometry's partial lines
+      g_aq_ctrl = nc;
+      // Remember this geometry's storage as a region. The kernel keeps READING
+      // the previous one after switching, so the regions accumulate and are
+      // never dropped. Only a geometry with real storage is worth recording.
+      if (nc.qstride != 0 && nc.wsize != 0)
+        // VORTEX_SWQ=1: software queues (plain stores + an atomic tail) never append through the
+        // window, so the region would never grow; take every queue of the geometry as storage
+        g_aq_regions.push_back(AqRegion{nc.qbase, nc.qstride, nc.cap * nc.wsize,
+                                        (getenv("VORTEX_SWQ") && getenv("VORTEX_SWQ")[0] == '1') ? (uint64_t)((g_aq_size / AQ_LINE) - 1) : 0});
+      size_t nq = (g_aq_size / AQ_LINE) - 1;
+      g_aq_tail.assign(nq, 0);
+      g_aq_ovf.clear();                // chunk lists belong to a geometry; the pool is never reset
+      g_aq_fill.assign(nq, 0);
+      g_aq_flushed.assign(nq, 0);
+      aq_reopen_clear();
+    }
+    return;
+  }
+  if (isa2_on()) {
+    // ISA2: a store into a queue line of the window is not an append any more (the append is an instruction).
+    // A kernel that still does it has a send site left on the old path: stop loudly rather than mis-time it.
+    fprintf(stderr, "ISA2 VIOLATION: window append to queue %lld (use the append instruction or VORTEX_LEGACY=1)\n", (long long)q);
+    std::abort();
+  }
+  this->aq_append((uint32_t)q, data, size);
+}
+
+uint32_t Emulator::aq_count(uint32_t q) {
+  return ((size_t)q < g_aq_tail.size()) ? g_aq_tail[q] : 0;
+}
+
+void Emulator::aq_append(uint32_t q, const void* data, uint32_t size) {
+  if ((size_t)q >= g_aq_tail.size() || g_aq_ctrl.wsize == 0) return;  // no geometry yet
+  // Refuse an append that would run past the queue's capacity. Without this the
+  // write lands in the NEXT queue's storage, and for the last queue past the end
+  // of the buffer entirely, which silently corrupts whatever the allocator put
+  // there (measured: a corrupted barrier word, and the kernel then spins).
+  // Dropping and counting turns that into a reported number.
+  if (g_aq_ctrl.cap != 0 && g_aq_tail[q] >= g_aq_ctrl.cap) {
+    // Region full. With an overflow pool, take the next chunk when this slot starts one;
+    // without (or with the pool or the queue's chunk table exhausted), drop and count.
+    uint64_t e = g_aq_tail[q] - g_aq_ctrl.cap;
+    if (g_aq_pool.ctab == 0 || g_aq_pool.ch == 0) { ++g_aq_dropped; return; }
+    uint64_t c = e / g_aq_pool.ch;
+    auto& v = g_aq_ovf[(uint32_t)q];
+    if (c >= v.size()) {
+      if (c >= g_aq_pool.maxc || g_aq_pool.next >= g_aq_pool.nch) { ++g_aq_dropped; return; }
+      uint64_t cb = g_aq_pool.base + g_aq_pool.next++ * g_aq_pool.ch * g_aq_ctrl.wsize;
+      v.push_back(cb); ++g_aq_ovf_chunks;
+#ifdef VM_ENABLE
+      mmu_.write(&cb, g_aq_pool.ctab + 8 * ((uint64_t)q * g_aq_pool.maxc + c), 8, ACCESS_TYPE::STORE);
+#else
+      mmu_.write(&cb, g_aq_pool.ctab + 8 * ((uint64_t)q * g_aq_pool.maxc + c), 8, 0);
+#endif
+    }
+  }
+  aq_note_queue(q);              // bounds this region for aq_is_qstorage
+  uint32_t t = g_aq_tail[q]++;
+  if (isa2_on()) {
+    // ISA2: the message lands at its slot in the program's layout; no count is mirrored into memory (receivers
+    // ask the slice with the count instruction, so a kernel that still reads a tails array reads zeros and fails)
+    uint64_t dst = aq_home_slot(q, t);
+#ifdef VM_ENABLE
+    mmu_.write(data, dst, size, ACCESS_TYPE::STORE);
+#else
+    mmu_.write(data, dst, size, 0);
+#endif
+    return;
+  }
+  uint64_t dst = aq_slot_addr((uint32_t)q, t);
+  uint32_t tv = t + 1;
+#ifdef VM_ENABLE
+  mmu_.write(data, dst, size, ACCESS_TYPE::STORE);
+  mmu_.write(&tv, g_aq_ctrl.tailbase + 4 * (uint64_t)q, 4, ACCESS_TYPE::STORE);
+#else
+  mmu_.write(data, dst, size, 0);
+  mmu_.write(&tv, g_aq_ctrl.tailbase + 4 * (uint64_t)q, 4, 0);
+#endif
+}
+
+// Apply engine command (docs/apply_engine_plan.md). Functional side: on the
+// trigger word, apply every word of the named queues to memory NOW and record
+// the trace of lines the timing side will replay. The timing side never
+// touches data.
+void Emulator::ap_write(const void* data, uint64_t addr, uint32_t size) {
+  uint32_t line = ap_line(addr);
+  if (line >= AP_NLANES) return;                       // done line and spares are read only
+  uint32_t off = (uint32_t)(addr & (AQ_LINE - 1));
+  if (off + size > AQ_LINE) return;
+  uint32_t core = core_->id();
+  uint64_t* cw = ap_cmdwords(core, line);
+  memcpy(reinterpret_cast<char*>(cw) + off, data, size);
+  if (off != AP_TRIG_OFF) return;                      // not the trigger word
+  const uint64_t qbase = cw[0], qstride = cw[1] & 0xffffffffull, tailbase = cw[2];
+  const uint32_t qstep0 = (uint32_t)(cw[1] >> 32);            // queues are q0, q0+step, ...
+  const uint32_t qstep = qstep0 ? qstep0 : 1u;
+  const uint32_t q0 = (uint32_t)cw[3], nq = (uint32_t)(cw[3] >> 32);
+  const uint64_t base = cw[4], stride = cw[5], spec = cw[6];
+  const uint32_t keyshift = (uint32_t)(spec & 0xff), keybits = (uint32_t)((spec >> 8) & 0xff);
+  const uint32_t valshift = (uint32_t)((spec >> 16) & 0xff), valbits = (uint32_t)((spec >> 24) & 0xff);
+  const uint32_t op = (uint32_t)((spec >> 32) & 0xff), wsize = (uint32_t)((spec >> 40) & 0xff);
+  const uint64_t valconst = spec >> 48;
+  auto maskof = [](uint32_t b) -> uint64_t { return b >= 64 ? ~0ull : ((1ull << b) - 1ull); };
+  if (wsize != 4 && wsize != 8) return;
+  ApTrace& tr = ap_trace(core, line);
+  tr.qlines.clear(); tr.qidx.clear(); tr.tlines.clear(); tr.op = op;
+  uint64_t last = ~0ull;
+  auto need_line = [&](uint64_t a) {
+    uint64_t l = a & ~(uint64_t)(AQ_LINE - 1);
+    if (l != last) { tr.qlines.push_back(l); last = l; }
+  };
+  for (uint32_t k = 0; k < nq; k++) {
+    const uint32_t q = q0 + k * qstep;
+    uint32_t tail = 0;
+    uint64_t ta_ = tailbase + 4ull * q;
+    mmu_.read(&tail, ta_, 4, 0);
+    need_line(ta_);
+    for (uint32_t i = 0; i < tail; i++) {
+      uint64_t wa = qbase + (uint64_t)q * qstride + (uint64_t)i * wsize;
+      uint64_t w = 0;
+      mmu_.read(&w, wa, wsize, 0);
+      need_line(wa);
+      uint64_t key = (w >> keyshift) & maskof(keybits);
+      uint64_t val = valbits ? ((w >> valshift) & maskof(valbits)) : valconst;
+      uint64_t ta = base + key * stride;
+      uint32_t cur = 0;
+      if (op == 1) { mmu_.read(&cur, ta, 4, 0); cur += (uint32_t)val; } else { cur = (uint32_t)val; }
+      mmu_.write(&cur, ta, 4, 0);
+      tr.qidx.push_back((uint32_t)(tr.qlines.size() - 1));
+      tr.tlines.push_back(ta & ~(uint64_t)(AQ_LINE - 1));
+    }
+  }
+  tr.pending = true;
+  ap_pending(core)++;
+  ap_done(core) = 0;
+}
+
 void Emulator::dcache_amo_reserve(uint64_t addr) {
   auto type = get_addr_type(addr);
-  if (type == AddrType::Global) {
+  // MsgMem is ordinary global memory functionally (only its timing is on-chip),
+  // so reservations must behave exactly as they do for Global.
+  if (type == AddrType::Global || type == AddrType::MsgMem) {
     mmu_.amo_reserve(addr);
   }
 }
 
 bool Emulator::dcache_amo_check(uint64_t addr) {
   auto type = get_addr_type(addr);
-  if (type == AddrType::Global) {
+  if (type == AddrType::Global || type == AddrType::MsgMem) {
     return mmu_.amo_check(addr);
   }
   return false;

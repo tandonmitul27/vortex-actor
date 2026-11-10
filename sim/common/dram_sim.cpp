@@ -82,12 +82,15 @@ public:
 		dram_config["MemorySystem"]["Controller"]["Scheduler"]["impl"] = "FRFCFS";
 		dram_config["MemorySystem"]["Controller"]["RefreshManager"]["impl"] = "AllBank";
 		dram_config["MemorySystem"]["Controller"]["RowPolicy"]["impl"] = "OpenRowPolicy";
-		{
-			YAML::Node draw_plugin;
-			draw_plugin["ControllerPlugin"]["impl"] = "TraceRecorder";
-			draw_plugin["ControllerPlugin"]["path"] = "./trace/ramulator.log";
-			dram_config["MemorySystem"]["Controller"]["plugins"].push_back(draw_plugin);
-		}
+		// DRAM command TraceRecorder disabled: it writes a multi-GB
+		// ./trace/ramulator.log per run and fills the disk on large sweeps. It
+		// does not affect timing or results. Re-enable for DRAM command debugging.
+		// {
+		// 	YAML::Node draw_plugin;
+		// 	draw_plugin["ControllerPlugin"]["impl"] = "TraceRecorder";
+		// 	draw_plugin["ControllerPlugin"]["path"] = "./trace/ramulator.log";
+		// 	dram_config["MemorySystem"]["Controller"]["plugins"].push_back(draw_plugin);
+		// }
 		dram_config["MemorySystem"]["AddrMapper"]["impl"] = "RoBaRaCoCh";
 
 		ramulator_frontend_ = Ramulator::Factory::create_frontend(dram_config);

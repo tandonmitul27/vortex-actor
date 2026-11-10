@@ -11,6 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <cstdlib>
 #include "cluster.h"
 
 using namespace vortex;
@@ -43,7 +44,7 @@ Cluster::Cluster(const SimContext& ctx,
   // Create l2cache
 
   snprintf(sname, 100, "%s-l2cache", this->name().c_str());
-  l2cache_ = CacheSim::Create(sname, CacheSim::Config{
+  CacheSim::Config l2cfg{
     !L2_ENABLED,
     log2ceil(L2_CACHE_SIZE),// C
     log2ceil(MEM_BLOCK_SIZE),// L
@@ -57,7 +58,35 @@ Cluster::Cluster(const SimContext& ctx,
     false,                  // write response
     L2_MSHR_SIZE,           // mshr size
     2,                      // pipeline latency
-  });
+    // P4 on chip transport: allocate a line on a write miss without fetching it.
+    // Env knob so a policy sweep needs no rebuild. Meaningful only with
+    // L2_WRITEBACK=1, which is a legal machine here because the L2 is the
+    // coherence point (the per core L1s stay write through).
+    (L2_WRITEBACK != 0) && (getenv("VORTEX_L2_NOFETCH") != nullptr)
+                        && (getenv("VORTEX_L2_NOFETCH")[0] == '1'),
+    // T38 ceiling probe. Queue storage never leaves the L2. Not a machine, and
+    // it needs no write-back, since it removes the traffic rather than moving it.
+    (getenv("VORTEX_L2_QORACLE") != nullptr) && (getenv("VORTEX_L2_QORACLE")[0] == '1'),
+  };
+  l2cfg.wack_sink = isa2_on() && L2_ENABLED;   // ISA2: the L2 acknowledges the writes it performs
+  if (l2cfg.wack_sink) wack_enable();
+  l2cache_ = CacheSim::Create(sname, l2cfg);
+  if (isa2_on()) fprintf(stderr, "[ISA2] append+count instructions, L1-skipping atomics, acked fence, L1INV; queue layout by the program\n");
+  // An ablation that changes nothing is void (see the ablation-validity note),
+  // so both L2 policies announce themselves and the arm log carries the proof.
+  if (getenv("VORTEX_L2_NOFETCH") && getenv("VORTEX_L2_NOFETCH")[0] == '1')
+    fprintf(stderr, "[L2 POLICY] write_nofetch on queue storage ACTIVE (writeback=%d)\n", (int)L2_WRITEBACK);
+  if (getenv("VORTEX_L2_QORACLE") && getenv("VORTEX_L2_QORACLE")[0] == '1')
+    fprintf(stderr, "[L2 POLICY] queue-storage ORACLE ACTIVE, size=%u bytes ways=%u\n",
+            (unsigned)L2_CACHE_SIZE, (unsigned)L2_NUM_WAYS);
+  // The machine this libsimx was BUILT for. A kernel built for one shape and run
+  // on a simulator built for another does not merely mis time, it can drop every
+  // append and still print a plausible cycle count. Every arm log now carries the
+  // simulator's own answer to "which machine am I".
+  if (cluster_id == 0)
+    fprintf(stderr, "[MACHINE] cores=%u warps=%u threads=%u L2=%s size=%u writeback=%d\n",
+            (unsigned)NUM_CORES, (unsigned)NUM_WARPS, (unsigned)NUM_THREADS,
+            L2_ENABLED ? "on" : "off", (unsigned)L2_CACHE_SIZE, (int)L2_WRITEBACK);
 
   // connect l2cache core interfaces
   for (uint32_t i = 0; i < sockets_per_cluster; ++i) {

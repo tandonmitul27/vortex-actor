@@ -4,6 +4,7 @@
 #include <vx_spawn.h>
 #include <vx_intrinsics.h>
 #include "common.h"
+#include "../skew.h"
 #ifndef SPLIT
 #define SPLIT 1   // lanes per actor, as in the actor kernels (log T41): the same problem
                   // on the same machine. Block b is actor b % N, slice b / N, so
@@ -39,7 +40,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
     // the same way.
     for (uint32_t k = 0; k < (uint32_t)((M) / (SPLIT)); k++) {
         const uint32_t i = ilo + k;
-        uint32_t g   = mix(me, i) % G_total;
+        uint32_t g   = skew_key(mix(me, i), G_total);
         uint32_t bkt = g;
         uint64_t ta = csr_read(VX_CSR_MCYCLE);
         __atomic_fetch_add(&counts[bkt], 1, __ATOMIC_RELAXED);  // PEs may share a bucket

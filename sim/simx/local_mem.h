@@ -69,4 +69,10 @@ protected:
   Impl* impl_;
 };
 
+// Remote-push registry (see AddrType::RemoteLmem in types.h): maps a GLOBAL
+// core id to that core's LocalMem so the emulator can deposit a pushed store
+// into the destination scratchpad. Registered by the Core constructor.
+void rpush_register(uint32_t core_id, LocalMem* lmem);
+LocalMem* rpush_lookup(uint32_t core_id);
+
 }

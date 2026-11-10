@@ -294,6 +294,7 @@ static op_string_t op_string(const Instr &instr) {
         }
       }
       case LsuType::FENCE: return {"FENCE", ""};
+      case LsuType::L1INV: return {"L1INV", ""};
       default:
         std::abort();
       }
@@ -314,6 +315,9 @@ static op_string_t op_string(const Instr &instr) {
         case AmoType::AMOMAX:  return {"AMOMAX.W", ""};
         case AmoType::AMOMINU: return {"AMOMINU.W", ""};
         case AmoType::AMOMAXU: return {"AMOMAXU.W", ""};
+        case AmoType::AMOCAS:  return {"AMOCAS.W", ""};
+        case AmoType::AQAPPEND: return {"AQAPPEND.W", ""};
+        case AmoType::AQCOUNT: return {"AQCOUNT", ""};
         default:
           std::abort();
         }
@@ -331,6 +335,9 @@ static op_string_t op_string(const Instr &instr) {
         case AmoType::AMOMAX:  return {"AMOMAX.D", ""};
         case AmoType::AMOMINU: return {"AMOMINU.D", ""};
         case AmoType::AMOMAXU: return {"AMOMAXU.D", ""};
+        case AmoType::AMOCAS:  return {"AMOCAS.D", ""};
+        case AmoType::AQAPPEND: return {"AQAPPEND.D", ""};
+        case AmoType::AQCOUNT: return {"AQCOUNT", ""};
         default:
           std::abort();
         }
@@ -751,7 +758,8 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
   } break;
   case Opcode::FENCE: {
     auto instr = std::allocate_shared<Instr>(instr_pool_, uuid, FUType::LSU);
-    instr->setOpType(LsuType::FENCE);
+    // ISA2: MISC-MEM funct3 7 (unused by RISC-V) = invalidate the L1 data cache
+    instr->setOpType(funct3 == 7 ? LsuType::L1INV : LsuType::FENCE);
     instr->setArgs(IntrLsuArgs{0, 0, 0});
     ibuffer.push_back(instr);
   } break;
@@ -765,19 +773,25 @@ void Emulator::decode(uint32_t code, uint32_t wid, uint64_t uuid) {
     case 0x02: instr->setOpType(AmoType::LR); break;
     case 0x03: instr->setOpType(AmoType::SC); break;
     case 0x04: instr->setOpType(AmoType::AMOXOR); break;
+    case 0x05: instr->setOpType(AmoType::AMOCAS); break;   // Zacas
     case 0x08: instr->setOpType(AmoType::AMOOR); break;
     case 0x0c: instr->setOpType(AmoType::AMOAND); break;
     case 0x10: instr->setOpType(AmoType::AMOMIN); break;
     case 0x14: instr->setOpType(AmoType::AMOMAX); break;
     case 0x18: instr->setOpType(AmoType::AMOMINU); break;
     case 0x1c: instr->setOpType(AmoType::AMOMAXU); break;
+    case 0x1e: instr->setOpType(AmoType::AQAPPEND); break;   // ISA2 append(q = rs1, message = rs2), rd = x0
+    case 0x1f: instr->setOpType(AmoType::AQCOUNT); break;    // ISA2 rd = count(q = rs1)
     default:
       std::abort();
     }
     instr->setArgs(IntrAmoArgs{funct3, aq, rl});
-    instr->setDestReg(rd, RegType::Integer);
+    if (funct5 != 0x1e)
+      instr->setDestReg(rd, RegType::Integer);
     instr->setSrcReg(0, rs1, RegType::Integer);
     instr->setSrcReg(1, rs2, RegType::Integer);
+    if (funct5 == 0x05)
+      instr->setSrcReg(2, rd, RegType::Integer);   // amocas: the expected value
     ibuffer.push_back(instr);
   } break;
   case Opcode::SYS: {

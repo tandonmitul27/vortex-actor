@@ -723,7 +723,8 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           }
         }
       } break;
-      case LsuType::FENCE: {
+      case LsuType::FENCE:
+      case LsuType::L1INV: {
         // no compute
       } break;
       default:
@@ -790,6 +791,23 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           auto rs1_data_u  = zext((Word)rs2_data[t].u64, data_width);
           uint64_t result = rs1_data_u;
           this->dcache_write(&result, mem_addr, data_bytes);
+          rd_data[t].i = read_data_i;
+        }
+      } break;
+      case AmoType::AMOCAS: {
+        // Zacas: if mem == rd (expected) then mem = rs2; rd = old mem
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          uint64_t mem_addr = rs1_data[t].u;
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          uint64_t read_data = 0;
+          this->dcache_read(&read_data, mem_addr, data_bytes);
+          auto read_data_i = sext((WordI)read_data, data_width);
+          if (zext((Word)read_data, data_width) == zext((Word)rs3_data[t].u64, data_width)) {
+            uint64_t result = zext((Word)rs2_data[t].u64, data_width);
+            this->dcache_write(&result, mem_addr, data_bytes);
+          }
           rd_data[t].i = read_data_i;
         }
       } break;
@@ -887,6 +905,25 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           rd_data[t].i = read_data_i;
         }
       } break;
+      case AmoType::AQAPPEND: {
+        // ISA2: the functional append happens now (slot = the queue's next, in issue order); no result
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          uint32_t q = (uint32_t)rs1_data[t].u;
+          trace_data->mem_addrs.at(t) = {(uint64_t)q, data_bytes};
+          this->aq_append(q, &rs2_data[t].u64, data_bytes);
+        }
+      } break;
+      case AmoType::AQCOUNT: {
+        for (uint32_t t = thread_start; t < num_threads; ++t) {
+          if (!warp.tmask.test(t))
+            continue;
+          uint32_t q = (uint32_t)rs1_data[t].u;
+          trace_data->mem_addrs.at(t) = {(uint64_t)q, 4};
+          rd_data[t].i = (Word)this->aq_count(q);
+        }
+      } break;
       case AmoType::AMOMAXU: {
         for (uint32_t t = thread_start; t < num_threads; ++t) {
           if (!warp.tmask.test(t))
@@ -906,7 +943,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
       default:
         std::abort();
       }
-      rd_write = true;
+      rd_write = (amo_type != AmoType::AQAPPEND);
     },
     [&](FpuType fpu_type) {
       auto fpuArgs = std::get<IntrFpuArgs>(instrArgs);

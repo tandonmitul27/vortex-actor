@@ -16,6 +16,7 @@
 #include "types.h"
 #include <util.h>
 #include <unordered_map>
+#include <string>
 #include <vector>
 #include <list>
 #include <queue>
@@ -107,12 +108,30 @@ struct line_t {
 	uint32_t lru_ctr;
 	bool     valid;
 	bool     dirty;
+	bool     pending;   // way reserved for an in-flight fill (VORTEX_CACHE_RESV)
 
 	void reset() {
 		valid = false;
 		dirty = false;
+		pending = false;
 	}
 };
+
+// VORTEX_CACHE_RESV (default 1): a miss RESERVES its victim way until the fill lands, and
+// the victim is clean once written back. Without it, every miss to a set while a fill is in
+// flight picked the same LRU way: fills overwrote each other (lines lost, fetched again) and
+// a dirty victim was written back once per colliding miss. 0 = the old model.
+// VORTEX_L2_NOFETCH_ALL=1 (with VORTEX_L2_NOFETCH=1): EVERY write miss allocates without a
+// fetch, not only queue storage. Real GPU L2s (NVIDIA) write-allocate with per-sector byte
+// masks and do not read the line on a write miss. Applies to every kernel alike (fair).
+static const bool g_nofetch_all = getenv("VORTEX_L2_NOFETCH_ALL") && getenv("VORTEX_L2_NOFETCH_ALL")[0] == '1';
+// VORTEX_AQ_TAILTAB=N (2026-11-03, L2 append realism): an L2 bank that accepts an append (a write
+// into queue storage) takes no input for the next N cycles, charging the tail-table
+// read-modify-write against the slice's own request slots. Off (0) by default.
+static const bool g_aq_spill_l2 = getenv("VORTEX_AQ_SPILL") ? std::string(getenv("VORTEX_AQ_SPILL")) == "l2" : aq_final_on();
+static const bool g_aq_protect = getenv("VORTEX_AQ_PROTECT") && getenv("VORTEX_AQ_PROTECT")[0] == '1';
+static const uint32_t g_aq_tailtab = getenv("VORTEX_AQ_TAILTAB") ? (uint32_t)atoi(getenv("VORTEX_AQ_TAILTAB")) : 0;
+static const bool g_cache_resv = !(getenv("VORTEX_CACHE_RESV") && getenv("VORTEX_CACHE_RESV")[0] == '0');
 
 struct set_t {
 	std::vector<line_t> lines;
@@ -134,7 +153,8 @@ struct set_t {
 		*repl_line_id = -1;
 		for (uint32_t i = 0, n = lines.size(); i < n; ++i) {
 			auto& line = lines.at(i);
-			if (max_cnt < line.lru_ctr) {
+			const bool resv = g_cache_resv && line.pending;
+			if (!resv && max_cnt < line.lru_ctr) {
 				max_cnt = line.lru_ctr;
 				*repl_line_id = i;
 			}
@@ -145,9 +165,14 @@ struct set_t {
 				} else {
 					++line.lru_ctr;
 				}
-			} else {
+			} else if (!resv) {
 				*free_line_id = i;
 			}
+		}
+		if (*repl_line_id == -1) {   // every candidate at lru 0 or reserved: first unreserved, else way 0
+			*repl_line_id = 0;
+			for (uint32_t i = 0, n = lines.size(); i < n; ++i)
+				if (!(g_cache_resv && lines.at(i).pending)) { *repl_line_id = i; break; }
 		}
 		return hit_line_id;
 	}
@@ -170,6 +195,8 @@ struct bank_req_t {
 	uint64_t uuid;
 	ReqType  type;
 	bool     write;
+	bool     amo = false;
+	uint8_t  aqop = 0;   // ISA2: 1 append, 2 count
 
 	bank_req_t() {
 		this->reset();
@@ -324,6 +351,41 @@ public:
 		, pipe_req_(TFifo<bank_req_t>::Create("", config.latency-1))
 	{
 		this->reset();
+		// VORTEX_AQ_PIN_BYTES=N (design A, pinned counter array): N bytes of the L2 are set aside
+		// for the spilled tail counters. Modelled as capacity only: N/64 lines, split evenly over
+		// the banks, spread over the sets, are never allocated (held reserved for the whole run).
+		const char* pb = getenv("VORTEX_AQ_PIN_BYTES");
+		if (pb && config_.write_nofetch) {
+			uint64_t lines = (strtoull(pb, nullptr, 0) + 63) / 64;
+			uint64_t nb = 1ull << config_.B, per = (lines + nb - 1) / nb;
+			uint64_t ns = sets_.size(), nw = params_.lines_per_set;
+			if (per > ns * (nw - 1)) per = ns * (nw - 1);   // always leave one usable way per set
+			for (uint64_t i = 0; i < per; ++i) {
+				uint64_t s = (i * 167) % ns, w = nw - 1 - i / ns;   // 167 odd: a bijection over the sets
+				sets_.at(s).lines.at(w).pending = true;               // reserved: never a victim, never free
+			}
+			if (bank_id_ == 0) fprintf(stderr, "[L2 POLICY] pinned tail-counter area %llu bytes (%llu lines per bank)\n",
+			                           (unsigned long long)strtoull(pb, nullptr, 0), (unsigned long long)per);
+		}
+		// VORTEX_AQ_FINAL default (no explicit PIN_BYTES): the area grows to 2 B per queue used as queues
+		// appear (pin_grow), with the same line order as above.
+		pin_auto_ = !pb && config_.write_nofetch && aq_final_on();
+	}
+
+	// Pins lines up to 2 B x (queues used), spread as the explicit area. A line in flight (pending)
+	// waits for a later cycle. A valid line is dropped from the timing model when pinned: its data is
+	// functional in RAM, and a dirty one's write-back is not charged (a few lines, once per new queue range).
+	void pin_grow() {
+		uint64_t nb = 1ull << config_.B, ns = sets_.size(), nw = params_.lines_per_set;
+		uint64_t need = ((aq_pin_entry_bytes() * g_aq_qhw + 63) / 64 + nb - 1) / nb;
+		if (need > ns * (nw - 1)) need = ns * (nw - 1);
+		while (pinned_ < need) {
+			auto& ln = sets_.at((pinned_ * 167) % ns).lines.at(nw - 1 - pinned_ / ns);
+			if (ln.pending) return;
+			ln.reset();
+			ln.pending = true;
+			++pinned_;
+		}
 	}
 
   void reset() {
@@ -349,9 +411,25 @@ public:
 		return perf_stats_;
 	}
 
+	// ISA2 L1INV: drop every valid line; a line reserved for a fill in flight is kept (the fill is fresh data)
+	void invalidate_all() {
+		for (auto& set : sets_)
+			for (auto& line : set.lines)
+				if (!line.pending) line.valid = false;
+	}
+	// ISA2: an atomic or append performed at the L2 leaves no stale copy in this L1
+	void invalidate_line(uint64_t addr) {
+		auto& set = sets_.at(params_.addr_set_id(addr));
+		uint64_t tag = params_.addr_tag(addr);
+		for (auto& line : set.lines)
+			if (line.valid && line.tag == tag) line.valid = false;
+	}
+
 private:
 
 	void processInputs() {
+		if (pin_auto_) pin_grow();
+		if (tt_busy_ > 0) { --tt_busy_; return; }   // VORTEX_AQ_TAILTAB: tail-table RMW
 		// proces inputs in prioroty order
 		do {
 			bank_req_t bank_req;
@@ -374,6 +452,15 @@ private:
 				auto& line  = set.lines.at(entry.line_id);
 				line.valid  = true;
 				line.tag    = entry.bank_req.addr_tag;
+				// A line just filled from memory matches memory. Without this the
+				// victim's dirty bit survived into its replacement, and the write
+				// that MISSED was never marked dirty at all, so a write-back L2
+				// silently dropped every write miss instead of writing it back.
+				// The replay below marks it dirty again if the request was a write.
+				line.dirty  = false;
+				// LASTBYTE: a merge fill keeps the messages the reopened line already holds
+				if (aq_lastbyte_filled(params_.mem_addr(bank_id_, entry.bank_req.set_id, entry.bank_req.addr_tag))) line.dirty = true;
+				if (g_cache_resv) { line.pending = false; line.lru_ctr = 0; }
 				mshr_.dequeue(&bank_req);
 				--pending_mshr_size_;
 				pipe_req_->push(bank_req);
@@ -400,7 +487,11 @@ private:
 				bank_req.addr_tag = params_.addr_tag(core_req.addr);
 				bank_req.req_tag = core_req.tag;
 				bank_req.write = core_req.write;
+				bank_req.amo = core_req.amo;
+				bank_req.aqop = core_req.aqop;
 				pipe_req_->push(bank_req);
+				if (g_aq_tailtab && config_.write_nofetch && core_req.write && aq_in_qregion(core_req.addr))
+					tt_busy_ = g_aq_tailtab;
 				if (core_req.write)
 					++perf_stats_.writes;
 				else
@@ -420,6 +511,17 @@ private:
 		case bank_req_t::None:
 			break;
 		case bank_req_t::Replay: {
+			// A write that missed is only now landing in the line the fill brought
+			// in, so this is where it becomes dirty. Marking it on the write HIT
+			// alone lost every write miss.
+			if ((bank_req.write || bank_req.amo) && config_.write_back) {
+				auto& set = sets_.at(bank_req.set_id);
+				int32_t free_line_id = -1, repl_line_id = 0;
+				int hit_line_id = set.tag_lookup(bank_req.addr_tag, &free_line_id, &repl_line_id);
+				if (hit_line_id != -1)
+					set.lines.at(hit_line_id).dirty = true;
+			}
+			if (bank_req.write && config_.wack_sink) wack_done(bank_req.cid);   // ISA2: a write that missed is done now
 			// send core response
 			if (!bank_req.write || config_.write_reponse) {
 				MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid};
@@ -428,16 +530,63 @@ private:
 			}
 		} break;
 		case bank_req_t::Core: {
+			// ISA2 COUNT: the queue's slice answers from its open line (number + byte mask) or the saved counter, one
+			// access in this bank's pipeline; it allocates nothing and never reaches DRAM.
+			if (bank_req.aqop == 2) {
+				MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid};
+				this->core_rsp_port.push(core_rsp);
+				--pending_mshr_size_;
+				break;
+			}
+			// ORACLE PROBE (T38), not a machine. Queue storage is answered here
+			// unconditionally, so the transport never misses, never allocates a
+			// line, never evicts anything and never reaches DRAM. This is the
+			// CEILING of P4 with no capacity assumption: everything else in the
+			// kernel still competes for the real cache. Off unless asked for.
+			if (config_.q_oracle
+			 && aq_is_qstorage(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag))) {
+				++perf_stats_.q_oracle_hits;
+				if (bank_req.write && config_.wack_sink) wack_done(bank_req.cid);
+				if (!bank_req.write || config_.write_reponse) {
+					MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid};
+					this->core_rsp_port.push(core_rsp);
+				}
+				--pending_mshr_size_;
+				break;
+			}
 			int32_t free_line_id = -1;
 			int32_t repl_line_id = 0;
 			auto& set = sets_.at(bank_req.set_id);
 			// tag lookup
 			int hit_line_id = set.tag_lookup(bank_req.addr_tag, &free_line_id, &repl_line_id);
+			// LASTBYTE: a reopened queue line holds only the messages appended since it was reopened, the earlier ones
+			// are in DRAM. A read of it fetches the line and merges before answering (a read arriving while that merge
+			// is in flight waits for it in the MSHR).
+			if (hit_line_id != -1 && !bank_req.write && !bank_req.amo && aq_lastbyte_on()) {
+				const bool waits_ = g_cache_resv && set.lines.at(hit_line_id).pending && mshr_.lookup(bank_req);
+				if (waits_ || aq_lastbyte_read(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag))) {
+					++perf_stats_.read_misses;
+					auto mshr_id = mshr_.enqueue(bank_req, hit_line_id);
+					if (!waits_) {
+						if (g_cache_resv) set.lines.at(hit_line_id).pending = true;
+						MemReq mem_req;
+						mem_req.addr  = params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag);
+						mem_req.write = false;
+						mem_req.tag   = mshr_id;
+						mem_req.cid   = bank_req.cid;
+						mem_req.uuid  = bank_req.uuid;
+						this->mem_req_port.push(mem_req);
+						++pending_fill_reqs_;
+					}
+					break;
+				}
+			}
 			if (hit_line_id != -1) {
 				// Hit handling
 				if (bank_req.write) {
 					// handle write has_hit
 					auto& hit_line = set.lines.at(hit_line_id);
+					if (config_.wack_sink) wack_done(bank_req.cid);   // ISA2: performed here
 					if (!config_.write_back) {
 						// forward write request to memory
 						MemReq mem_req;
@@ -450,7 +599,19 @@ private:
 					} else {
 						// mark line as dirty
 						hit_line.dirty = true;
+						if (config_.write_nofetch && aq_set_on()
+						 && aq_reopenbit_hit(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag)))
+							tt_busy_ += 1;   // E2b: slot = saved base + popcount, the base is read from the pinned area
+						if (config_.write_nofetch && aq_set_on()
+						 && aq_take_done(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag))) {
+							hit_line.lru_ctr = 1u << 30;   // design A: a full queue line leaves first
+							++g_aq_evict_first;
+							aq_reopenbit_full(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag));
+						}
 					}
+				} else if (bank_req.amo && config_.write_back) {
+					// an AMO executes at the L2: read-modify-write leaves the line dirty
+					set.lines.at(hit_line_id).dirty = true;
 				}
 				// send core response
 				if (!bank_req.write || config_.write_reponse) {
@@ -466,7 +627,41 @@ private:
 				else
 					++perf_stats_.read_misses;
 
-				if (free_line_id == -1 && config_.write_back) {
+				// a miss that merges into a fill already in flight replaces nothing
+				// (a no-fetch write to a line whose fill is in flight also merges: allocating a
+				// second copy of the line would leave two ways with the same tag)
+				const bool merged_ = g_cache_resv && mshr_.lookup(bank_req);
+				// design A + VORTEX_AQ_PROTECT=1: the replacement skips open (part-filled) queue lines while
+				// any other way can go; the open bit the design already keeps is the only state used.
+				if (g_aq_protect && free_line_id == -1 && config_.write_nofetch && aq_set_on()) {
+					auto open_ = [&](int w) { return aq_open_tail_addr(params_.mem_addr(bank_id_, bank_req.set_id, set.lines.at(w).tag)) != 0; };
+					if (open_(repl_line_id)) {
+						int best = -1; uint32_t bc = 0;
+						for (int w = 0, n = (int)set.lines.size(); w < n; ++w) {
+							auto& l = set.lines.at(w);
+							if ((g_cache_resv && l.pending) || open_(w)) continue;
+							if (best == -1 || l.lru_ctr > bc) { best = w; bc = l.lru_ctr; }
+						}
+						if (best != -1) { repl_line_id = best; ++g_aq_protect_saves; }
+					}
+				}
+				// E1, VORTEX_AQ_OPENWAYS=W: a queue line (append, or the refetch of a reopened line) is placed only
+				// in ways 0..W-1: an invalid one there, else the oldest unreserved one there.
+				// ISA2: a queue line is one an APPEND allocates (the request says so); legacy: by address
+				const bool qline_ = isa2_on() ? (bank_req.aqop == 1)
+				                              : aq_is_qstorage(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag));
+				if (aq_openways() && bank_req.write && config_.write_nofetch && !merged_ && qline_) {
+					int fl = -1, best = -1; uint32_t bc = 0;
+					for (int w = 0, n = std::min<int>((int)aq_openways(), (int)set.lines.size()); w < n; ++w) {
+						auto& l = set.lines.at(w);
+						if (g_cache_resv && l.pending) continue;
+						if (!l.valid) { fl = w; break; }
+						if (best == -1 || l.lru_ctr > bc) { best = w; bc = l.lru_ctr; }
+					}
+					if (fl != -1) { free_line_id = fl; ++g_aq_openways_allocs; }
+					else if (best != -1) { free_line_id = -1; repl_line_id = best; ++g_aq_openways_allocs; }
+				}
+				if (free_line_id == -1 && config_.write_back && !merged_) {
 					// write back dirty line
 					auto& repl_line = set.lines.at(repl_line_id);
 					if (repl_line.dirty) {
@@ -477,10 +672,55 @@ private:
 						this->mem_req_port.push(mem_req);
 						DT(3, this->name() << "-writeback: " << mem_req);
 						++perf_stats_.evictions;
+						aq_lastbyte_evicted(mem_req.addr);
+						if (g_cache_resv) repl_line.dirty = false;   // written back once
+						if (config_.write_nofetch && aq_set_on()) {   // design A: open line evicted -> tail spill + refill
+							uint64_t ta = aq_open_tail_addr(mem_req.addr);
+							if (ta != 0) {
+								++g_aq_open_evicts;
+								aq_reopen_note(mem_req.addr);
+								if (g_aq_spill_l2) tt_busy_ += 2;   // VORTEX_AQ_SPILL=l2: tail word spill + refill in the L2
+								else for (int s = 0; s < 2; ++s) {
+									MemReq tr; tr.addr = ta & ~(uint64_t)63; tr.write = true; tr.cid = bank_req.cid;
+									this->mem_req_port.push(tr);
+								}
+							}
+						}
 					}
 				}
 
-				if (bank_req.write && !config_.write_back) {
+				if (bank_req.write && config_.write_back && config_.write_nofetch && !merged_
+				 && (g_nofetch_all || qline_)
+				 && !aq_reopen_take(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag))) {
+					// P4, allocate without fetch. The line is being written, so
+					// fetching it from memory only to overwrite it is pure waste.
+					// Take the victim, evict it if dirty (done above), and make
+					// the line present and dirty now. No fill request, so the
+					// write never touches memory on the way in and the reader
+					// that follows finds it here.
+					int32_t line_id = (free_line_id != -1) ? free_line_id : repl_line_id;
+					auto& line = set.lines.at(line_id);
+					line.valid = true;
+					line.tag   = bank_req.addr_tag;
+					line.dirty = true;
+					if (g_cache_resv) line.lru_ctr = 0;   // just used: not the victim's age
+					if (aq_set_on() && aq_reopenbit_alloc(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag)))
+						tt_busy_ += 1;   // E2b: reopened without a fetch, the append reads the saved base
+					if (aq_set_on()) aq_lastbyte_alloc(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag));
+					if (aq_set_on() && aq_take_done(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag))) {
+						line.lru_ctr = 1u << 30;   // design A: a full queue line leaves first
+						++g_aq_evict_first;
+						aq_reopenbit_full(params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag));
+					}
+					++perf_stats_.write_nofetch_allocs;
+					if (config_.wack_sink) wack_done(bank_req.cid);   // ISA2: performed here
+					if (config_.write_reponse) {
+						MemRsp core_rsp{bank_req.req_tag, bank_req.cid, bank_req.uuid};
+						this->core_rsp_port.push(core_rsp);
+					}
+					--pending_mshr_size_;
+				} else if (bank_req.write && !config_.write_back) {
+					if (config_.wack_sink) wack_done(bank_req.cid);   // ISA2: performed (written through) here
 					// forward write request to memory
 					{
 						MemReq mem_req;
@@ -508,9 +748,11 @@ private:
 
 					// send fill request
 					if (!mshr_pending) {
+						if (g_cache_resv) set.lines.at((free_line_id != -1) ? free_line_id : repl_line_id).pending = true;
 						MemReq mem_req;
 						mem_req.addr  = params_.mem_addr(bank_id_, bank_req.set_id, bank_req.addr_tag);
 						mem_req.write = false;
+						mem_req.amo   = bank_req.amo;
 						mem_req.tag   = mshr_id;
 						mem_req.cid   = bank_req.cid;
 						mem_req.uuid  = bank_req.uuid;
@@ -535,6 +777,9 @@ private:
   std::vector<set_t> sets_;
 	MSHR mshr_;
 	uint32_t pending_mshr_size_;
+	uint32_t tt_busy_ = 0;
+	bool pin_auto_ = false;
+	uint64_t pinned_ = 0;
 	TFifo<bank_req_t>::Ptr pipe_req_;
 
 	CacheSim::PerfStats perf_stats_;
@@ -666,11 +911,21 @@ public:
 			auto& core_req = core_req_port.front();
 			if (core_req.type == AddrType::IO) {
 				this->processBypassRequest(core_req, req_id);
+			} else if (config_.l1skip_ops && core_req.l1skip) {
+				// ISA2: atomics, appends and counts are performed at the L2; this L1 forwards them uncached
+				if (core_req.write || core_req.amo)
+					banks_.at(params_.addr_bank_id(core_req.addr))->invalidate_line(core_req.addr);
+				this->processBypassRequest(core_req, req_id);
 			} else {
 				bank_core_xbar_->ReqIn.at(req_id).push(core_req, 0);
 			}
 			core_req_port.pop();
 		}
+	}
+
+	void invalidate_all() {
+		if (config_.bypass) return;
+		for (auto& bank : banks_) bank->invalidate_all();
 	}
 
 	PerfStats perf_stats() const {
@@ -746,4 +1001,8 @@ void CacheSim::tick() {
 
 CacheSim::PerfStats CacheSim::perf_stats() const {
   return impl_->perf_stats();
+}
+
+void CacheSim::invalidate_all() {
+  impl_->invalidate_all();
 }

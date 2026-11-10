@@ -49,7 +49,7 @@ Socket::Socket(const SimContext& ctx,
   });
 
   snprintf(sname, 100, "%s-dcaches", this->name().c_str());
-  dcaches_ = CacheCluster::Create(sname, cores_per_socket, NUM_DCACHES, CacheSim::Config{
+  CacheSim::Config dcfg{
     !DCACHE_ENABLED,
     log2ceil(DCACHE_SIZE),  // C
     log2ceil(L1_LINE_SIZE), // L
@@ -63,7 +63,9 @@ Socket::Socket(const SimContext& ctx,
     false,                  // write response
     DCACHE_MSHR_SIZE,       // mshr size
     2,                      // pipeline latency
-  });
+  };
+  dcfg.l1skip_ops = isa2_on();   // ISA2: atomics, appends and counts pass the L1 on its uncached path
+  dcaches_ = CacheCluster::Create(sname, cores_per_socket, NUM_DCACHES, dcfg);
 
   // find overlap
   uint32_t overlap = MIN(ICACHE_MEM_PORTS, L1_MEM_PORTS);
@@ -117,6 +119,10 @@ Socket::~Socket() {
   //--
 }
 
+void Socket::dcache_invalidate() {
+  dcaches_->invalidate_all();
+}
+
 void Socket::reset() {
   //--
 }
@@ -156,7 +162,7 @@ int Socket::get_exitcode() const {
 }
 
 void Socket::barrier(uint32_t bar_id, uint32_t count, uint32_t core_id) {
-  cluster_->barrier(bar_id, count, socket_id_ * cores_.size() + core_id);
+  cluster_->barrier(bar_id, count, core_id);   // core_id is already global (Core::id)
 }
 
 void Socket::resume(uint32_t core_index) {

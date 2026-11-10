@@ -107,6 +107,24 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
+// Remote-push registry (see local_mem.h). Raw pointers are safe: LocalMem
+// objects live for the whole simulation, and the registry is rebuilt from
+// scratch on every processor construction.
+static std::vector<LocalMem*> g_rpush_lmems;
+
+void vortex::rpush_register(uint32_t core_id, LocalMem* lmem) {
+  if (g_rpush_lmems.size() <= core_id) {
+    g_rpush_lmems.resize(core_id + 1, nullptr);
+  }
+  g_rpush_lmems.at(core_id) = lmem;
+}
+
+LocalMem* vortex::rpush_lookup(uint32_t core_id) {
+  return g_rpush_lmems.at(core_id);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
 LocalMem::LocalMem(const SimContext& ctx, const char* name, const Config& config)
 	: SimObject<LocalMem>(ctx, name)
 	, Inputs(config.num_reqs, this)

@@ -1,3 +1,4 @@
+#include <cstdlib>
 // Copyright © 2019-2023
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,6 +20,7 @@
 #include <util.h>
 #include "debug.h"
 #include "core.h"
+#include "socket.h"
 #include "constants.h"
 #include "cache_sim.h"
 #include "VX_types.h"
@@ -208,6 +210,8 @@ void LsuUnit::tick() {
 			// wait for all pending memory operations to complete
 			if (!state.pending_rd_reqs.empty())
 				continue;
+			// ISA2: and for every write of this core to be acknowledged by the L2 (stores and appends)
+			if (!wack_idle(core_->id())) { ++g_isa2_fence_wait; continue; }
 			Outputs.at(iw).push(state.fence_trace, 1);
 			state.fence_lock = false;
 			DT(3, this->name() << "-fence-unlock: " << state.fence_trace);
@@ -220,15 +224,29 @@ void LsuUnit::tick() {
 
 		bool is_fence = false;
 		bool is_write = false;
+		uint8_t aqop = 0;
 
 		auto trace = input.front();
 		if (std::get_if<LsuType>(&trace->op_type)) {
 			auto lsu_type = std::get<LsuType>(trace->op_type);
+			if (lsu_type == LsuType::L1INV) {
+				// ISA2: invalidate the L1 (the socket's data cache); lines with a fill in flight are kept
+				core_->socket()->dcache_invalidate();
+				++g_isa2_l1invs;
+				Outputs.at(iw).push(trace, 1);
+				input.pop();
+				continue;
+			}
 			is_fence = (lsu_type == LsuType::FENCE);
 			is_write = (lsu_type == LsuType::STORE);
 		} else if (std::get_if<AmoType>(&trace->op_type)) {
 			auto amp_type = std::get<AmoType>(trace->op_type);
-			is_write = (amp_type != AmoType::LR);
+			// VORTEX_AMO_RT=1: an AMO returns a value, so it is timed as a round trip
+			// (a read the warp waits for), not as a fire-and-forget write
+			static const bool amo_rt = getenv("VORTEX_AMO_RT") && getenv("VORTEX_AMO_RT")[0] == '1';
+			is_write = !amo_rt && (amp_type != AmoType::LR);
+			if (amp_type == AmoType::AQAPPEND) { is_write = true; aqop = 1; }   // ISA2: one-way, returns nothing
+			if (amp_type == AmoType::AQCOUNT)  { is_write = false; aqop = 2; }  // ISA2: returns the count
 		}
 	#ifdef EXT_V_ENABLE
 		else if (std::get_if<VlsType>(&trace->op_type)) {
@@ -293,6 +311,8 @@ void LsuUnit::tick() {
 			// setup memory request
 			LsuReq lsu_req(NUM_LSU_LANES);
 			lsu_req.write = is_write;
+			lsu_req.amo = !is_write && aqop == 0 && std::get_if<AmoType>(&trace->op_type);
+			lsu_req.aqop = aqop;
 			uint32_t t0 = pending_addrs_.size() - remain_addrs_;
 			for (uint32_t i = 0; i < NUM_LSU_LANES; ++i) {
 				lsu_req.mask.set(i);
@@ -319,6 +339,7 @@ void LsuUnit::tick() {
 
 			// update stats
 			if (is_write) {
+				wack_add(trace->cid, count);   // ISA2: acknowledged by the L2 (see wack_*)
 				core_->perf_stats_.stores += count;
 			} else {
 				core_->perf_stats_.loads += count;

@@ -82,6 +82,18 @@ init_regs:
   LOAD_IMMEDIATE64(sp, STACK_BASE_ADDR)
   csrr  t0, VX_CSR_MHARTID
   sll   t1, t0, STACK_LOG2_SIZE
+#ifdef STACK_COLOR
+  /* Stack colouring (HPARCH log T42). With a power of two stride every thread's
+     stack top sits at the same offset in its slot, so all of them fall in ONE
+     L1 set and ONE L2 bank. The caches are write through and do not allocate on
+     a write, so every stack store goes to DRAM through that one bank, and the
+     socket's shared L1 to L2 port backs up behind it: instruction fetch misses
+     waited 16K cycles each and the launch cost 100K cycles per warp. A stride
+     of 8 KB + 64 B puts consecutive threads in consecutive sets and banks.
+     Every thread keeps its full STACK_SIZE. */
+  slli  t2, t0, 6
+  add   t1, t1, t2
+#endif
   sub   sp, sp, t1
 
   # set thread pointer register

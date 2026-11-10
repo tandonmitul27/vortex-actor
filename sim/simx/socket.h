@@ -51,6 +51,8 @@ public:
     return cluster_;
   }
 
+  void dcache_invalidate();   // ISA2 L1INV
+
   void reset();
 
   void tick();

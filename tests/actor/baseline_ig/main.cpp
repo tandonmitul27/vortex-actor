@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <vortex.h>
 #include "common.h"
+#include "../skew.h"
 #ifndef SPLIT
 #define SPLIT 1
 #endif
@@ -88,6 +89,9 @@ int main(int argc, char** argv) {
         for (uint32_t i = 0; i < M; i++) {
             uint32_t dst  = mix(me, 2*i + 1) % N;
             uint32_t lidx = mix(me, 2*i + 2) % TABLE_SIZE;
+#if SKEW > 1
+            { const uint32_t k_ = skew_key(mix(me, 2*i + 1), (uint32_t)(N) * (uint32_t)TABLE_SIZE); dst = k_ % (uint32_t)(N); lidx = (k_ / (uint32_t)(N)) % (uint32_t)TABLE_SIZE; }
+#endif
             expected[me * M + i] = (int)(dst * 1000000 + lidx);
         }
     }

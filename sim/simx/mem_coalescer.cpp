@@ -139,7 +139,18 @@ void MemCoalescer::tick() {
   out_req.mask = out_mask;
   out_req.tag = tag;
   out_req.write = in_req.write;
+  out_req.amo = in_req.amo;
+  out_req.aqop = in_req.aqop;
+  out_req.l1skip = in_req.l1skip;
   out_req.addrs = out_addrs;
+  if (in_req.write) {   // ISA2 write acks: merged lanes leave as one request (IO excepted, as in the switch)
+    int64_t n = 0;
+    for (uint32_t o = 0; o < output_size_; ++o)
+      if (out_mask.test(o) && get_addr_type(out_addrs.at(o)) != AddrType::IO) ++n;
+    for (uint32_t i = 0; i < input_size_; ++i)
+      if (cur_mask.test(i) && get_addr_type(in_req.addrs.at(i)) != AddrType::IO) --n;
+    wack_add(in_req.cid, n);
+  }
   out_req.cid = in_req.cid;
   out_req.uuid = in_req.uuid;
 

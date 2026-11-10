@@ -4,6 +4,7 @@
 #include <vx_spawn.h>
 #include <vx_intrinsics.h>
 #include "common.h"
+#include "../skew.h"
 #ifndef SPLIT
 #define SPLIT 1   // lanes per actor, as in the actor kernels (log T41): the same problem
                   // on the same machine. Block b is actor b % N, slice b / N, so
@@ -37,6 +38,9 @@ void kernel_body(args_t* __UNIFORM__ a) {
         const uint32_t i = ilo + k;
         uint32_t dst  = mix(me, 2*i + 1) % (uint32_t)N;            // which PE's table
         uint32_t lidx = mix(me, 2*i + 2) % (uint32_t)TABLE_SIZE;   // which entry
+#if SKEW > 1
+        { const uint32_t k_ = skew_key(mix(me, 2*i + 1), (uint32_t)(N) * (uint32_t)TABLE_SIZE); dst = k_ % (uint32_t)(N); lidx = (k_ / (uint32_t)(N)) % (uint32_t)TABLE_SIZE; }
+#endif
         tgt[TGT_IDX(me, i, N)] = table[dst * TABLE_SIZE + lidx];   // a[b[i]] gather
     }
     vx_fence();

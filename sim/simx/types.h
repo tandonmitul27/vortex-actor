@@ -305,7 +305,8 @@ inline std::ostream &operator<<(std::ostream &os, const MdvType& type) {
 enum class LsuType {
   LOAD,
   STORE,
-  FENCE
+  FENCE,
+  L1INV      // ISA2: invalidate the core's L1 data cache (whole cache, lines in flight kept)
 };
 
 struct IntrLsuArgs {
@@ -319,6 +320,7 @@ inline std::ostream &operator<<(std::ostream &os, const LsuType& type) {
   case LsuType::LOAD:   os << "LOAD"; break;
   case LsuType::STORE:  os << "STORE"; break;
   case LsuType::FENCE:  os << "FENCE"; break;
+  case LsuType::L1INV:  os << "L1INV"; break;
   default:
     assert(false);
   }
@@ -338,7 +340,10 @@ enum class AmoType {
   AMOMIN,
   AMOMAX,
   AMOMINU,
-  AMOMAXU
+  AMOMAXU,
+  AMOCAS,    // Zacas amocas.w/.d: rd holds the expected value on entry
+  AQAPPEND,  // ISA2: one-way append(q = rs1, message = rs2), 4 B (.w) or 8 B (.d); no result
+  AQCOUNT    // ISA2: rd = messages in queue q = rs1 this round, answered by the queue's L2 slice
 };
 
 struct IntrAmoArgs {
@@ -360,6 +365,9 @@ inline std::ostream &operator<<(std::ostream &os, const AmoType& type) {
   case AmoType::AMOMAX:  os << "AMOMAX"; break;
   case AmoType::AMOMINU: os << "AMOMINU"; break;
   case AmoType::AMOMAXU: os << "AMOMAXU"; break;
+  case AmoType::AMOCAS:  os << "AMOCAS"; break;
+  case AmoType::AQAPPEND: os << "AQAPPEND"; break;
+  case AmoType::AQCOUNT: os << "AQCOUNT"; break;
   default:
     assert(false);
   }
@@ -706,8 +714,177 @@ using IntrArgs = std::variant<
 enum class AddrType {
   Global,
   Shared,
+  MsgMem,     // on-chip actor message memory: global/coherent data, on-chip timing
+  RemoteLmem, // remote-push window: a store deposits into ANOTHER core's LMEM
+  AppendQ,    // combining append queue window: a store is an append(q, word)
   IO
 };
+
+// Modeled on-chip message memory. Set from the environment
+// (VORTEX_MSGMEM_BASE / VORTEX_MSGMEM_SIZE, both in bytes) so a kernel can place
+// its actor inboxes there. Size 0 disables the model, restoring stock behaviour.
+// The data stays in the global memory image, so it remains coherent across cores;
+// only the TIMING is served by the on-chip structure. This models a hardware
+// queue's storage without needing per-core private semantics.
+extern uint64_t g_msgmem_base;
+extern uint64_t g_msgmem_size;
+
+// Modeled remote scratchpad push (see remote_push_plan.md). The window is laid
+// out as base + dst_core * (1 << LMEM_LOG_SIZE) + offset: a store into it
+// deposits directly into the DESTINATION core's LMEM, bypassing the memory
+// hierarchy. Set from the environment (VORTEX_RPUSH_BASE / VORTEX_RPUSH_SIZE,
+// bytes); size 0 disables the model, restoring stock behaviour. v0 timing is an
+// optimistic ceiling: the store is charged like a local scratchpad access, with
+// no NoC hop or destination-bank contention. Kernels should treat the window as
+// write-only (push model); reads are supported for debugging only.
+extern uint64_t g_rpush_base;
+extern uint64_t g_rpush_size;
+
+inline uint32_t rpush_core(uint64_t addr) {
+  return (uint32_t)((addr - g_rpush_base) >> LMEM_LOG_SIZE);
+}
+
+// Modeled combining append queue (see docs/append_queue_plan.md). The window
+// starts at VORTEX_AQ_BASE and spans VORTEX_AQ_SIZE bytes; size 0 disables the
+// model and restores stock behaviour. Line 0 of the window is a control block
+// the KERNEL writes before its first append: {qbase, qstride, tailbase, wsize}
+// as four 8 byte words. Line q+1 is queue q: a store to any byte of that line
+// is append(q, word). Functionally the word lands at
+// qbase + q*qstride + tail[q]*wsize in the global image and tail[q] is
+// mirrored to tailbase + 4q, so the consumer reads the queue and its length
+// with ordinary loads after a barrier. Timing: the lane is charged a
+// scratchpad access on the queue's line (LocalMem banks by line, so appends to
+// different queues take different banks and appends to one queue serialise on
+// its combining port), and every (64/wsize)'th append to a queue issues one
+// full line write down the ordinary dcache path. v0 does not charge L2 tail
+// contention, the NoC hop, or combining line capacity; it reports the peak
+// number of queues touched instead.
+extern uint64_t g_aq_base;
+extern uint64_t g_aq_size;
+struct AqCtrl { uint64_t qbase; uint64_t qstride; uint64_t tailbase; uint64_t wsize; uint64_t cap; };
+extern AqCtrl g_aq_ctrl;
+extern std::vector<uint32_t> g_aq_tail;   // functional: next slot per queue
+extern std::vector<uint32_t> g_aq_fill;   // timing: appends seen per queue
+extern uint64_t g_aq_appends;
+extern uint64_t g_aq_dropped;   // appends refused because a queue was full
+extern uint64_t g_aq_flushes;
+extern uint64_t g_aq_tail_flushes;         // partial line writes charged at an aq_flush or a geometry change
+extern std::vector<uint32_t> g_aq_flushed;  // timing: fill count per queue at its last flush
+extern uint64_t g_aq_used_hw;              // queues ever used, across chunk resets
+extern uint64_t g_aq_maxfill_hw;           // deepest queue ever, across chunk resets
+constexpr uint32_t AQ_FLUSH_OFF = 40;       // control word 5: any store flushes the round's partial lines
+// Control word 6: END OF ROUND. Flush the partial lines as word 5 does, then
+// reset every queue's tail to zero, in the model and in the tails array the
+// kernel reads. P3 sends its mail in K chunks with a receive between, so a
+// queue is FILLED AND DRAINED K times, and its storage is a small buffer reused
+// each chunk instead of one sized for the whole run. That is what bounds the
+// live footprint, and it is also what makes the tail charge exact per chunk.
+constexpr uint32_t AQ_ROUND_OFF = 48;
+// Control word 7: OVERFLOW POOL (skewed traffic). Tagged stores, value = (field << 60) | payload:
+// 1 pool base, 2 chunk table base (0 = overflow off: a full queue drops, as before), 3 (chunk words << 32) |
+// max chunks per queue, 4 pool size in chunks. When a queue's region is full, the L2 append unit takes the
+// next chunk from the pool (one atomic per chunk) and writes its address to ctab[q * maxc + c] (64 bit).
+constexpr uint32_t AQ_POOL_OFF = 56;
+struct AqPool { uint64_t base; uint64_t ctab; uint64_t ch; uint64_t maxc; uint64_t nch; uint64_t next; };
+extern AqPool g_aq_pool;
+extern std::unordered_map<uint32_t, std::vector<uint64_t>> g_aq_ovf;   // functional: chunk bases per queue
+extern uint64_t g_aq_ovf_chunks;                                        // chunks taken (all geometries)
+inline uint64_t aq_slot_addr(uint32_t q, uint64_t slot) {               // slot -> address, region or chunk
+  if (g_aq_ctrl.cap == 0 || slot < g_aq_ctrl.cap || g_aq_pool.ctab == 0)
+    return g_aq_ctrl.qbase + (uint64_t)q * g_aq_ctrl.qstride + slot * g_aq_ctrl.wsize;
+  uint64_t e = slot - g_aq_ctrl.cap, c = e / g_aq_pool.ch;
+  auto it = g_aq_ovf.find(q);
+  if (it == g_aq_ovf.end() || c >= it->second.size()) return g_aq_ctrl.qbase + (uint64_t)q * g_aq_ctrl.qstride;
+  return it->second[c] + (e % g_aq_pool.ch) * g_aq_ctrl.wsize;
+}
+void aq_tail_flush();                       // charge one line write per queue whose tail sits mid line
+constexpr uint32_t AQ_LINE = 64;
+
+// queue index of a window address; -1 is the control block
+inline int64_t aq_queue(uint64_t addr) {
+  return (int64_t)((addr - g_aq_base) / AQ_LINE) - 1;
+}
+
+// ---- apply engine (typed drains): docs/apply_engine_plan.md ----------------
+// One engine per core on the core's memory port. A lane writes an 8-word
+// command line (line = lane) in its window, the last word triggering; the
+// engine streams the named queues and scatters STORE/ADD through a small
+// combining cache. Line AP_DONE_LINE word 0 reads as the core's done flag.
+// One command slot per hardware lane of the core: warp id x threads + lane.
+// Several warps share one engine and one done flag; a warp that polls while
+// another's command is active simply waits for it too, which is conservative.
+constexpr uint32_t AP_NLANES    = (NUM_WARPS) * (NUM_THREADS);
+constexpr uint32_t AP_DONE_LINE = AP_NLANES;
+constexpr uint32_t AP_WINDOW    = (AP_NLANES + 16) * AQ_LINE;
+constexpr uint32_t AP_TRIG_OFF  = 56;          // byte offset of word 7 in the line
+inline uint64_t ap_base() { return g_aq_base + g_aq_size; }
+// P4: is this address inside the queue's storage array, i.e. a line the transport
+// writes WHOLE? Only such a line may be allocated without fetching it. An atomic
+// read modify write, or any partial write, still needs the old bytes.
+//
+// A kernel installs SEVERAL geometries in one run: the index gather appends to
+// its tile queues under one, then rewrites the control block and appends replies
+// under another, while STILL READING the tile queues it filled. Testing only the
+// installed geometry therefore misses the reads of every earlier one, so each
+// geometry is remembered as a region and the test is against all of them. The
+// region is bounded by the highest queue index actually appended, which keeps it
+// inside the host's storage buffer: the window always has more queue slots than
+// a kernel uses, and taking the whole window would spill into the next
+// allocation and wrongly exempt it.
+struct AqRegion { uint64_t lo; uint64_t stride; uint64_t cap_bytes; uint64_t maxq; };
+extern std::vector<AqRegion> g_aq_regions;
+void aq_note_queue(int64_t q);            // record the highest queue index touched
+bool aq_is_qstorage(uint64_t addr);
+bool aq_in_qregion(uint64_t addr);
+bool aq_set_on();
+uint32_t aq_pin_entry_bytes();             // pinned-area entry: 2 B, or 8 B with VORTEX_AQ_OVFCHG and a pool                         // VORTEX_AQ_SET (design A)
+bool aq_final_on();                       // VORTEX_AQ_FINAL: the decided L2 append is the default
+extern uint64_t g_aq_qhw;                 // highest queue appended to + 1 (auto pinned area)
+bool aq_take_done(uint64_t line_addr);     // line made full by an append: mark evict-first once
+void aq_reopen_note(uint64_t line_addr);   // VORTEX_AQ_CNTMASK: open line evicted early
+bool aq_reopen_take(uint64_t line_addr);   // VORTEX_AQ_CNTMASK: next append to it refetches the line
+void aq_reopen_clear();                    // VORTEX_AQ_CNTMASK / REOPENBIT: new round or geometry
+bool aq_lastbyte_alloc(uint64_t line_addr);    // VORTEX_AQ_LASTBYTE: reopened without a fetch (line now partial)
+bool aq_lastbyte_read(uint64_t line_addr);     // VORTEX_AQ_LASTBYTE: a read of a partial line fetches and merges
+bool aq_lastbyte_filled(uint64_t line_addr);   // VORTEX_AQ_LASTBYTE: that merge fill landed (line stays dirty)
+void aq_lastbyte_evicted(uint64_t line_addr);  // VORTEX_AQ_LASTBYTE: a line written back is no longer partial
+bool aq_lastbyte_on();
+bool aq_reopenbit_alloc(uint64_t line_addr);   // VORTEX_AQ_REOPENBIT (E2b)
+bool aq_reopenbit_hit(uint64_t line_addr);
+void aq_reopenbit_full(uint64_t line_addr);
+uint32_t aq_openways();                    // VORTEX_AQ_OPENWAYS (E1), 0 = off
+extern uint64_t g_aq_openways_allocs;
+uint64_t aq_open_tail_addr(uint64_t line_addr);   // tail word of an open line, 0 if not open
+// ---- ISA2 (2026-11-10, the final mechanism in the paper): two new instructions, the append (one-way, sender
+// names the queue) and the count (returns a queue's message count from its L2 slice); every atomic, append and
+// count passes the L1 and is performed at the L2; a fence waits until the core's writes are acknowledged by the
+// L2; L1INV invalidates the L1 at a barrier; queue storage is laid out by the program at the addresses the L2's
+// ordinary mapping places in the queue's slice and set (no remap of ordinary accesses). Default ON;
+// VORTEX_LEGACY=1 restores the old model exactly (window appends, tails mirrored, atomics via the L1,
+// loads-only fence, remapped queue regions, e1w4a knobs off unless set).
+bool isa2_on();
+uint64_t aq_home_slot(uint32_t q, uint64_t slot);   // ISA2: address of a queue's slot in the program's layout
+void wack_add(uint32_t cid, int64_t n);             // ISA2: core cid has n more writes on their way to the L2
+void wack_done(uint32_t cid);                       // ISA2: the L2 performed one of core cid's writes
+bool wack_idle(uint32_t cid);                       // ISA2: every write of core cid acknowledged
+void wack_enable();                                 // ISA2: an L2 that acknowledges writes exists
+extern uint64_t g_isa2_appends, g_isa2_counts, g_isa2_l1skips, g_isa2_l1invs, g_isa2_fence_wait;
+extern uint64_t g_aq_open_evicts, g_aq_evict_first, g_aq_protect_saves;       // any byte of a queue region or the pool (appends only write there)
+inline bool ap_is_window(uint64_t addr) {
+  return g_aq_size != 0 && addr >= ap_base() && (addr - ap_base()) < AP_WINDOW;
+}
+inline uint32_t ap_line(uint64_t addr) { return (uint32_t)((addr - ap_base()) / AQ_LINE); }
+struct ApTrace {
+  std::vector<uint64_t> qlines;   // queue (and tail) lines to read, in order
+  std::vector<uint32_t> qidx;     // per word: index into qlines it needs
+  std::vector<uint64_t> tlines;   // per word: target line
+  uint32_t op = 0;                // 0 STORE, 1 ADD
+  bool pending = false;           // traced functionally, not yet activated
+};
+ApTrace&  ap_trace(uint32_t core, uint32_t lane);
+uint64_t* ap_cmdwords(uint32_t core, uint32_t lane);   // 8-word staging
+uint32_t& ap_done(uint32_t core);
+uint32_t& ap_pending(uint32_t core);
 
 inline AddrType get_addr_type(uint64_t addr) {
   if (addr >= IO_BASE_ADDR && addr < IO_END_ADDR) {
@@ -718,6 +895,15 @@ inline AddrType get_addr_type(uint64_t addr) {
         return AddrType::Shared;
     }
   }
+  if (g_msgmem_size != 0 && addr >= g_msgmem_base && (addr - g_msgmem_base) < g_msgmem_size) {
+    return AddrType::MsgMem;
+  }
+  if (g_rpush_size != 0 && addr >= g_rpush_base && (addr - g_rpush_base) < g_rpush_size) {
+    return AddrType::RemoteLmem;
+  }
+  if (g_aq_size != 0 && addr >= g_aq_base && (addr - g_aq_base) < g_aq_size + AP_WINDOW) {
+    return AddrType::AppendQ;   // the queue window and, right after it, the apply engine window
+  }
   return AddrType::Global;
 }
 
@@ -725,6 +911,9 @@ inline std::ostream &operator<<(std::ostream &os, const AddrType& type) {
   switch (type) {
   case AddrType::Global: os << "Global"; break;
   case AddrType::Shared: os << "Shared"; break;
+  case AddrType::MsgMem: os << "MsgMem"; break;
+  case AddrType::RemoteLmem: os << "RemoteLmem"; break;
+  case AddrType::AppendQ: os << "AppendQ"; break;
   case AddrType::IO:     os << "IO"; break;
   default: assert(false);
   }
@@ -906,6 +1095,9 @@ struct LsuReq {
   BitVector<> mask;
   std::vector<uint64_t> addrs;
   bool     write;
+  bool     amo;   // AMO timed as a read (VORTEX_AMO_RT=1): the L2 still marks its line dirty
+  uint8_t  aqop = 0;     // ISA2: 1 append (addrs = queue numbers at the LSU, slot addresses after the switch), 2 count
+  bool     l1skip = false;   // ISA2: atomics, appends and counts pass the L1 untouched and are performed at the L2
   uint32_t tag;
   uint32_t cid;
   uint64_t uuid;
@@ -914,6 +1106,7 @@ struct LsuReq {
     : mask(size)
     , addrs(size, 0)
     , write(false)
+    , amo(false)
     , tag(0)
     , cid(0)
     , uuid(0)
@@ -964,6 +1157,9 @@ struct LsuRsp {
 struct MemReq {
   uint64_t addr;
   bool     write;
+  bool     amo = false;
+  uint8_t  aqop = 0;         // ISA2: 1 append, 2 count (see LsuReq)
+  bool     l1skip = false;   // ISA2: the L1 forwards it on its uncached path
   AddrType type;
   uint32_t tag;
   uint32_t cid;
@@ -1584,7 +1780,8 @@ public:
   LocalMemSwitch(
     const SimContext& ctx,
     const char* name,
-    uint32_t delay
+    uint32_t delay,
+    uint32_t core_id = 0
   );
 
   void reset();
@@ -1593,6 +1790,7 @@ public:
 
 private:
   uint32_t delay_;
+  uint32_t core_id_;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
