@@ -102,6 +102,14 @@ int main() {
                   << " serveK=" << (uint64_t)(pf[2] / nwarps) << " reply=" << (uint64_t)(pf[3] / nwarps) << " barrier=" << (uint64_t)(pf[4] / nwarps) << "\n"; }
     std::cout << "phases (mean cycles/actor): p1=" << (uint64_t)(s1 / nwarps) << " p2=" << (uint64_t)(s2 / nwarps)
               << " total=" << (uint64_t)(st / nwarps) << " max_total=" << tmax << "\n";
+#if PROBE_APPLYT
+    { double h = 0, s = 0, r = 0, x = 0; for (auto& y : ph) { h += y.pa_h; s += y.pa_s; r += y.pa_r; x += y.pa_x; }
+      std::cout << "probe apply (mean per warp): handler=" << (uint64_t)(h / nwarps) << " hsend=" << (uint64_t)(s / nwarps)
+                << " recv=" << (uint64_t)(r / nwarps) << " send=" << (uint64_t)(x / nwarps) << " total=" << (uint64_t)(st / nwarps) << "\n"; }
+#endif
+#if ROUND1
+    { double r1 = 0; for (auto& y : ph) r1 += y.r1; std::cout << "probe round1 send=" << (uint64_t)(r1 / nwarps) << "\n"; }
+#endif
     std::vector<uint8_t> seen(n, 0); uint64_t bad = 0;
     for (auto v : perm) { if (v >= n || seen[v]) bad++; else seen[v] = 1; }
     const uint64_t want = 2 * throws + n;

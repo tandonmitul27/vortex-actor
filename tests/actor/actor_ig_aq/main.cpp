@@ -10,6 +10,12 @@
 #include <algorithm>
 #include <vortex.h>
 #include "common.h"
+#ifndef PROBE_NOAPPLY
+#define PROBE_NOAPPLY 0   // 1: measurement only, no table reads or output writes (results are not checked, counts are)
+#endif
+#ifndef PROBE_NOREPLY
+#define PROBE_NOREPLY 0   // 1: measurement only, the owner sends no replies
+#endif
 #ifndef ACTOR
 #define ACTOR 1
 #endif
@@ -55,7 +61,7 @@ int main(int argc, char** argv) {
                   << "; rebuild with -DNASSUME=" << N << "\n"; return 1; }
     uint32_t blocks_per_core = (uint32_t)warps / (PW * (SPLIT));   // a block is SPLIT warps wide
     if (blocks_per_core == 0) blocks_per_core = 1;
-    if (blocks_per_core * (size_t)BUF_WORDS * sizeof(int) > 16384) {
+    if (blocks_per_core * (size_t)BUF_WORDS * sizeof(int) > (LMEM_BYTES)) {
         std::cerr << "scratchpad overflow\n"; return 1; }
     uint32_t NB = N / GLANES;
     size_t NQ       = (size_t)N * NB;                          // queues
@@ -237,8 +243,8 @@ int main(int argc, char** argv) {
                 if (ok) pcov += o[GLANES] - o[0];
             }
 #endif
-    if (pcov != (long long)N * M) {
-        std::cout << "  PTABLE: runs cover " << pcov << " replies, want " << (long long)N*M << "\n"; tbad++; }
+    if (pcov != (PROBE_NOREPLY ? 0ll : (long long)N * M)) {   // PROBE_NOREPLY: no replies by design
+        std::cout << "  PTABLE: runs cover " << pcov << " replies, want " << (PROBE_NOREPLY ? 0ll : (long long)N*M) << "\n"; tbad++; }
     std::cout << "table audit: replies " << pcov << ", " << tbad << " problems\n";
 
     int bad = 0;
@@ -329,7 +335,7 @@ int main(int argc, char** argv) {
     }
 #endif
     if (bar[3]) std::cout << "QUEUE OVERFLOW: " << bar[3] << " queues longer than AQ_QCAP -- raise NCHUNK\n";
-    bool ok = (bad==0 && tbad==0 && bar[2]==0 && bar[3]==0);
+    bool ok = ((bad==0 || PROBE_NOAPPLY || PROBE_NOREPLY) && tbad==0 && bar[2]==0 && bar[3]==0);
     std::cout << "result: total_queries=" << (uint64_t)N*M << " errors=" << bad
               << " table_problems=" << tbad << "\n" << (ok ? "PASSED" : "FAILED") << "\n";
     vx_mem_free(tb); vx_mem_free(qsb); vx_mem_free(tlb); vx_mem_free(rtb); vx_mem_free(rvb);

@@ -63,7 +63,7 @@ typedef void* vx_buffer_h;
 #define VX_ISA_EXT_TCU              (1ull << (32+ISA_EXT_TCU))
 
 // ready wait timeout
-#define VX_MAX_TIMEOUT              (24*60*60*1000)   // 24 Hr
+#define VX_MAX_TIMEOUT              (30ULL*24*60*60*1000)   // 30 days (was 24 h: longer sims read back an unfinished device)
 
 // device memory access
 #define VX_MEM_READ                 0x1

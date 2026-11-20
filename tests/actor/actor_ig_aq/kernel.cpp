@@ -95,7 +95,20 @@ static char* g_sq_st; static uint32_t* g_sq_tl; static uint32_t g_sq_stride, g_s
 static inline void swq_phase(uint64_t st, uint32_t stride_b, uint64_t tl, uint32_t ws, uint32_t cap) {
     g_sq_st = (char*)st; g_sq_stride = stride_b; g_sq_tl = (uint32_t*)tl; g_sq_ws = ws; g_sq_cap = cap;
 }
+#ifndef PROBE_SEND
+#define PROBE_SEND 0
+#endif
 static inline void swq_put(uint32_t q, uint64_t w) {
+#if PROBE_SEND   // PROBE ONLY (motivation, fails the check), as swq.h: shadow tails, every queue stays empty
+    uint32_t* sh_ = (uint32_t*)g_sq_st + q;
+    __asm__ volatile("" :: "r"(sh_), "r"(w));   // the message is still formed
+#if PROBE_SEND == 1
+    __asm__ volatile("amoadd.w zero, %1, (%0)" :: "r"(sh_), "r"(1u) : "memory");
+#elif PROBE_SEND == 2
+    { const uint32_t t_ = __atomic_fetch_add(sh_, 1u, __ATOMIC_RELAXED); __asm__ volatile("add zero, %0, zero" :: "r"(t_)); }
+#endif
+    return;
+#endif
     const uint32_t s = __atomic_fetch_add(&g_sq_tl[q], 1u, __ATOMIC_RELAXED);
     if (s < g_sq_cap) {
         char* p = g_sq_st + (size_t)q * g_sq_stride + (size_t)s * g_sq_ws;
@@ -250,14 +263,26 @@ static __attribute__((noinline)) void serve_tile32(const uint32_t* q, uint32_t t
 // this call lies inside one TILE_SZ slice.
 static __attribute__((noinline)) void serve_tile(const uint64_t* q, uint32_t tail, const int* tslice,
                                                  uint32_t NB, uint32_t blk) {
+    uint32_t s_ = 0; (void)s_;
     for (uint32_t i = 0; i < tail; i++) {
         uint64_t w     = q[QIX_(q, i)];
         uint32_t asker = (uint32_t)(w >> 32);
         uint32_t pay   = (uint32_t)w;
         uint32_t que   = TK_QUE(pay);
+#if PROBE_NOAPPLY
+        uint32_t val   = pay;                       // measurement only: no table read
+#else
         uint32_t val   = (uint32_t)tslice[TK_LIX(pay)];
+#endif
+#if PROBE_NOREPLY
+        s_ += val ^ asker ^ que;                    // measurement only: no reply sent
+#else
         aq_append64(RQ_ID(asker, que, NB, blk), ((uint64_t)que << 32) | (uint64_t)val);
+#endif
     }
+#if PROBE_NOREPLY
+    if (s_ == 0x7fffffffu) ((volatile int*)tslice)[0] = (int)s_;
+#endif
 }
 #endif
 
@@ -621,19 +646,41 @@ static_assert((REPLY_TILE) && !(TGT_T) && !(APPLY), "DRAIN_DIRECT: reply tiles, 
 // the drain round in one leaf: the warp takes reply tiles t = sub, sub+SPLIT, ... and for each
 // the block's 16 actors one at a time; 16 lanes read 16 consecutive replies (WC_U loads first)
 // and store each value at tgt[actor*M + question]: one actor's tile is a contiguous span
+#if PROBE_NOAPPLY || PROBE_NOREPLY
+#define DD_DO(w) s_ += (uint32_t)(w)                // measurement only: read the reply, write no output
+#else
 #define DD_DO(w) row[(uint32_t)((w) >> 32)] = (int)(uint32_t)(w)
+#endif
 #if LANE_RECV
 // piece C off: lane ln drains its own actor's reply tiles t = sub, sub + SPLIT, ... alone, a reply per load
 static __attribute__((noinline)) void drain_direct(const uint64_t* __UNIFORM__ rq, int* __UNIFORM__ tgt,
                                                    uint32_t ln, uint32_t __UNIFORM__ sub, uint32_t __UNIFORM__ blk) {
     const uint32_t ac = blk * (uint32_t)GLANES + ln;
     int* row = tgt + (size_t)ac * (M);
+    uint32_t s_ = 0; (void)s_; (void)row;
+#if PROBE_LIVE
+    // MEASUREMENT ONLY (motivation, live state): PROBE_LIVE lanes drain at a time, the others take turns
+    // with an empty range, so fewer askers' output rows are written at once. Off = identical binary.
+#pragma GCC unroll 1
+    for (uint32_t g_ = 0; g_ < (uint32_t)(NUM_THREADS) / (uint32_t)(PROBE_LIVE); g_++) {
+#pragma GCC unroll 1
+    for (uint32_t t = (ln % (uint32_t)(NUM_THREADS)) / (uint32_t)(PROBE_LIVE) == g_ ? sub : (uint32_t)(REPLY_TILE);
+         t < (uint32_t)(REPLY_TILE); t += (uint32_t)(SPLIT)) {
+        const uint64_t* r = QPTR_(rq, RQ_STRIDE, ac * (uint32_t)REPLY_TILE + t);
+#pragma GCC unroll 1
+        for (uint32_t k = 0; k < (uint32_t)(RTILE_SZ); k++) { const uint64_t w = r[QIX_(r, k)]; DD_DO(w); }
+    } }
+#else
 #pragma GCC unroll 1
     for (uint32_t t = sub; t < (uint32_t)(REPLY_TILE); t += (uint32_t)(SPLIT)) {
         const uint64_t* r = QPTR_(rq, RQ_STRIDE, ac * (uint32_t)REPLY_TILE + t);
 #pragma GCC unroll 1
         for (uint32_t k = 0; k < (uint32_t)(RTILE_SZ); k++) { const uint64_t w = r[QIX_(r, k)]; DD_DO(w); }
     }
+#endif
+#if PROBE_NOAPPLY || PROBE_NOREPLY
+    if (s_ == 0x7fffffffu) row[0] = (int)s_;
+#endif
 }
 #else
 static __attribute__((noinline)) void drain_direct(const uint64_t* __UNIFORM__ rq, int* __UNIFORM__ tgt,
@@ -728,6 +775,14 @@ static __attribute__((noinline)) uint32_t serve_round(args_t* __UNIFORM__ a, int
 #if REQ32
           serve_tile32(QPTR_((const uint32_t*)a->ts_addr, TQ_STRIDE32, tid2), tail,
                        table + (size_t)me * TABLE_SIZE, t, (uint32_t)NB, (uint32_t)blk);
+#elif PROBE_LIVE
+          // MEASUREMENT ONLY (motivation, live state): PROBE_LIVE lanes of the warp serve at a time, the others
+          // take turns with an empty range, so fewer owners' table slices are read at once. Off = identical binary.
+#pragma GCC unroll 1
+          for (uint32_t g_ = 0; g_ < (uint32_t)(NUM_THREADS) / (uint32_t)(PROBE_LIVE); g_++)
+              serve_tile(QPTR_(ts, TQ_STRIDE_W, tid2),
+                         ((uint32_t)tid % (uint32_t)(NUM_THREADS)) / (uint32_t)(PROBE_LIVE) == g_ ? tail : 0u,
+                         table + (size_t)me * TABLE_SIZE, (uint32_t)NB, (uint32_t)blk);
 #else
           serve_tile(QPTR_(ts, TQ_STRIDE_W, tid2), tail, table + (size_t)me * TABLE_SIZE,
                      (uint32_t)NB, (uint32_t)blk);

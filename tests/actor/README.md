@@ -52,6 +52,7 @@ Each kernel directory holds the actor version and the non-actor version of one w
 | `prp_aq` | PageRank, pull (request and reply) | `-DACTOR=0` | env `PR_LROWS` |
 | `sssp_aq` | Single-source shortest paths | `-DACTOR=0` | env `SS_LROWS` |
 | `tc_aq` | Triangle counting | `-DACTOR=0` | env `TC_MTX=<graph>.mmio` and `TC_DEGORD=1` |
+| `permute_aq` | Sparse matrix permutation (bale's `permute_matrix`) | `-DACTOR=0` | env `PM_LROWS` |
 
 - `*_LROWS` is rows per actor at 256 actors, like `l_numrows` in bale.
 - The TC graphs are not in the repository. They are SNAP graphs (`roadNet-PA`, `amazon0312`, `loc-gowalla`, `soc-Slashdot0811`, `soc-Epinions1`, `ca-HepTh`, `email-EuAll`, `ca-GrQc`) and one random Erdős–Rényi graph, stored as `<name>_adj.mmio` adjacency lists.
@@ -62,6 +63,7 @@ Shared headers:
 - `swq.h`: software queues.
 - `skew.h`: input skew.
 - `lmem_check.h`: scratchpad layout checks.
+- `probe_apply.h`: measurement-only timers for the motivation figure (`PROBE_APPLYT=1`, `ROUND1=1`). Off by default, and then the binary is unchanged.
 
 ### Versions and switches (compile flags)
 
@@ -79,7 +81,13 @@ Each piece of the design can be switched off by itself:
 | D | Actor placement: the actor count is chosen apart from the lane count | `-DNASSUME=1024 -DSPLIT=1` (one actor per lane) |
 
 The histogram and index gather kernels use their own names for the same pieces; see their `common.h`.
+`permute_aq` has only our design and the non-actor version, with no switches. Its row tiles are 128 rows (`RTILE`),
+so the output lines being filled at once fit the L2. At `PM_LROWS=10000` it needs `-DAQ_SIZE=0x200000` and
+`VORTEX_AQ_SIZE=0x200000` for its 22,784 queues.
 Skewed inputs (randperm, shortest paths, TC) also split the sending work by edge rather than by row.
+
+Scratchpad size: the kernels assume 16 KB per core (`-DLMEM_BYTES=16384`). For another size, build the simulator with
+`-DLMEM_LOG_SIZE=<log2 bytes>` and pass the same `-DLMEM_LOG_SIZE` and a matching `-DLMEM_BYTES` to the kernel.
 
 ## Build and run
 
@@ -121,6 +129,14 @@ Runtime settings:
 - **`VORTEX_AQ_BASE` and `VORTEX_AQ_SIZE`:** the queue region.
 
 A run ends with `PASSED` or `FAILED` and `PERF:` lines. The total is in `PERF: instrs=..., cycles=...`.
+
+Other simulator changes:
+- **`-DXBAR_RR`** (simulator `CONFIGS`): round-robin arbitration in the crossbar. The default fixed priority can starve a
+  core and hang polling kernels on 32 cores.
+- **Timeout:** the runtime waits up to 30 days for the device (it was 24 h, and longer runs read back an unfinished device).
+- **Diagnostics,** off unless set: `VORTEX_MEM_PAGEHIST=<file>` writes DRAM reads and writes per 4 KB page;
+  `VORTEX_EPOCH_RANGES=lo-hi[,lo-hi...]` counts, between global barriers, the distinct 64 B lines of those hex
+  ranges that cores read and write; `VORTEX_ALLOC_LOG=1` prints each device allocation.
 
 ## Message-passing kernels (first study)
 

@@ -22,6 +22,8 @@ extern "C" uint64_t baseline_has_no_aq_window(void);
 LMEM_CHECK((TILE_A) * (SPLIT) * 8, (NASSUME) / (GLANES));
 #endif
 #include "../abl.h"
+#include "../probe_apply.h"
+static_assert(!ROUND1 || NOTILE || LANE_RECV, "ROUND1: the baseline's drain path only");
 
 static inline void gbarrier_ep(volatile uint32_t* bar, int slot, int tid, int NB, uint32_t ep) {
 #if ISA2
@@ -146,6 +148,7 @@ static __attribute__((noinline)) uint64_t ss_round(const args_t* __UNIFORM__ a, 
     uint32_t* fcnt = (uint32_t*)a->cnt_addr;
     uint32_t* stamp = (uint32_t*)a->stamp_addr;
     const uint64_t td = csr_read(VX_CSR_MCYCLE);
+    PA_DECL
     if (r != 0) {
 #if NOTILE
         // handler: an L2 atomic min on tent; a vertex that dropped is queued once a round (round stamp)
@@ -164,7 +167,9 @@ static __attribute__((noinline)) uint64_t ss_round(const args_t* __UNIFORM__ a, 
             uint32_t* fr_ = (uint32_t*)a->fr_addr + (size_t)o * vl;
             const uint32_t qi = p * N + o, h = heads[qi], tl = QCOUNT(qi);
 #if LANE_RECV
-            LANE_RANGE(qi, h, tl, GMIN)
+#define GMIN_P(x) PA_H(GMIN(x))
+            LANE_RANGE(qi, h, tl, GMIN_P)
+#undef GMIN_P
 #else
             WC_RANGE(qi, h, tl, GMIN, WC_U)
 #endif
@@ -195,6 +200,9 @@ static __attribute__((noinline)) uint64_t ss_round(const args_t* __UNIFORM__ a, 
 #undef LMIN
 #endif
     }
+#if PROBE_APPLYT
+    { phase_cycles_t* ph_ = &((phase_cycles_t*)a->phase_addr)[blk * (SPLIT) + sub]; PA_FLUSH(ph_) }
+#endif
     vx_fence();
     pf[0] += csr_read(VX_CSR_MCYCLE) - td;
 #endif
@@ -205,7 +213,11 @@ static __attribute__((noinline)) uint64_t ss_round(const args_t* __UNIFORM__ a, 
         const uint64_t t0 = csr_read(VX_CSR_MCYCLE);
         uint32_t fc = 0;
 #if NOTILE || LANE_RECV
+#if ROUND1
+        if (r == 0) fc = vl;                               // probe: every vertex sends in round 0
+#else
         if (r == 0) fc = o == a->src % N ? 1u : 0u;       // uniform: the source (placed in fr by the host)
+#endif
         else fc = fcnt[o];                                 // the drain above counted this actor's dropped vertices
         vx_fence();
         fcnt[o] = 0;                                       // uniform store, after every lane read it
@@ -247,14 +259,14 @@ static __attribute__((noinline)) uint64_t ss_round(const args_t* __UNIFORM__ a, 
 #if SEND_LANE
 #pragma GCC unroll 1
         for (uint32_t i = ln; i < fc; i += GLANES) {
-            const uint32_t l = fr[i], e1 = off[l + 1];
+            const uint32_t l = ROUND1 ? i : fr[i], e1 = off[l + 1];
             const double d = as_f64(tent[l]);
 #pragma GCC unroll 1
             for (uint32_t e = off[l]; e < e1; e++) {
 #else
 #pragma GCC unroll 1
         for (uint32_t i = 0; i < fc; i++) {
-            const uint32_t l = fr[i], e1 = off[l + 1];
+            const uint32_t l = ROUND1 ? i : fr[i], e1 = off[l + 1];
             const double d = as_f64(tent[l]);
 #pragma GCC unroll 1
             for (uint32_t e = off[l] + ln; e < e1; e += GLANES) {
@@ -307,6 +319,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
         if (vx_vote_any((int)((uint32_t)rv != 0))) flag[r] = 1;
         vx_fence();
         BARRIER();
+        if (ROUND1) { r += 2; break; }                    // probe: round 0 only
     }
     const uint32_t rounds = r - 1;                        // rounds that sent (the last one found nothing)
 #else

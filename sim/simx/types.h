@@ -1480,7 +1480,11 @@ public:
     , lg2_inputs_(log2ceil(num_inputs))
     , lg2_outputs_(log2ceil(num_outputs))
     , output_sel_(output_sel)
-    , collisions_(0) {
+    , collisions_(0)
+#ifdef XBAR_RR
+    , rr_next_(num_outputs, 0)
+#endif
+  {
     assert(delay != 0);
     assert(num_inputs <= 64);
     assert(num_outputs <= 64);
@@ -1507,7 +1511,14 @@ public:
     for (uint32_t o = 0; o < O; ++o) {
       int32_t input_idx = -1;
       bool has_collision = false;
+#ifdef XBAR_RR
+      // round-robin per output: the scan starts after the input this output granted last
+      // (the fixed lowest-index-first scan starved the last sockets of a 32-core machine)
+      for (uint32_t k = 0; k < I; ++k) {
+        uint32_t i = (rr_next_[o] + k) % I;
+#else
       for (uint32_t i = 0; i < I; ++i) {
+#endif
         auto& req_in = Inputs.at(i);
         if (req_in.empty())
           continue;
@@ -1533,6 +1544,9 @@ public:
         Outputs.at(o).push(RspType(req, input_idx), delay_);
         req_in.pop();
         collisions_ += has_collision;
+#ifdef XBAR_RR
+        rr_next_[o] = (input_idx + 1) % I;
+#endif
       }
     }
   }
@@ -1548,6 +1562,9 @@ protected:
   uint32_t lg2_outputs_;
   std::function<uint32_t(const Type& req)> output_sel_;
   uint64_t collisions_;
+#ifdef XBAR_RR
+  std::vector<uint32_t> rr_next_;
+#endif
 };
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -11,6 +11,12 @@
 #include <algorithm>
 #include <vortex.h>
 #include "common.h"
+#ifndef PROBE_NOAPPLY
+#define PROBE_NOAPPLY 0   // 1: measurement only, no reads or adds of the owner's state (values are not checked, counts are)
+#endif
+#ifndef PROBE_NOREPLY
+#define PROBE_NOREPLY 0   // 1: measurement only, the owner sends no replies (only the requests are counted)
+#endif
 #include "../isa2.h"
 
 int main() {
@@ -170,8 +176,8 @@ int main() {
         sum += g;
         maxrel = std::max(maxrel, std::fabs(g - rpr[r]) / rpr[r]);
     }
-    const bool ok = itmin == itmax && itmax == rit && maxrel < 1e-9 && std::fabs(sum - 1.0) < 0.001
-                    && (!ACTOR || recvd == (uint64_t)rit * 2 * nnz);
+    const bool ok = itmin == itmax && itmax == rit && ((maxrel < 1e-9 && std::fabs(sum - 1.0) < 0.001) || PROBE_NOAPPLY || PROBE_NOREPLY)
+                    && (!ACTOR || recvd == (uint64_t)rit * (PROBE_NOREPLY ? 1 : 2) * nnz);
     std::cout << "validation: iterations " << itmax << " (warps agree " << (itmin == itmax) << ") of " << rit
               << ", max relative rank error " << maxrel << ", rank sum " << sum;
     if (ACTOR) std::cout << ", messages received " << recvd << " of " << (uint64_t)rit * 2 * nnz;

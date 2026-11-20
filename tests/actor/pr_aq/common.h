@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // PageRank (push), after HClib-Actor's bale_actor tests (srirajpaul/hclib, branch bale3_actor):
 // test/pagerank_push_LU_selector.cpp (the actor version) and test/pagerank_push_LU_agi.cpp (the non-actor baseline).
 // Input: the tests' graph, bale's erdos_renyi_random_graph(n, p, UNDIRECTED, NOLOOPS) (strictly lower L) made
@@ -60,7 +63,7 @@
 #ifndef LANE_RECV
 #define LANE_RECV  0        // 1: piece C off: a lane drains a whole queue by itself; with tiles each lane has its
 #endif                      //    own TILE_W / 16-double tile
-static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 8 <= 16384), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
+static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 8 <= (LMEM_BYTES)), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
 #define KW         ((NOTILE || !LANE_RECV) ? (TILE_W) : (TILE_W) / (GLANES))   // rows per queue key (tile)
 constexpr uint32_t pr_log2(uint32_t x) { return x <= 1 ? 0 : 1 + pr_log2(x / 2); }
 #define TB         (pr_log2(KW))       // bits of the in-tile row

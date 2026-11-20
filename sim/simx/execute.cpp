@@ -31,6 +31,8 @@
 #endif
 #include "VX_types.h"
 
+void epoch_touch(uint64_t addr, uint32_t bytes, bool rd, bool wr);   // processor.cpp diagnostic
+
 using namespace vortex;
 
 inline uint64_t nan_box(uint32_t value) {
@@ -672,7 +674,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           uint64_t mem_addr = rs1_data[t].i + offset;
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, false);
           switch (lsuArgs.width) {
           case 0: // RV32I: LB
           case 1: // RV32I: LH
@@ -710,7 +712,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
             continue;
           uint64_t mem_addr = rs1_data[t].i + offset;
           uint64_t write_data = rs2_data[t].u64;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, false, true);
           switch (lsuArgs.width) {
           case 0:
           case 1:
@@ -743,7 +745,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, false);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           this->dcache_amo_reserve(mem_addr);
@@ -755,7 +757,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, false, true);
           if (this->dcache_amo_check(mem_addr)) {
             this->dcache_write(&rs2_data[t].u64, mem_addr, data_bytes);
             rd_data[t].i = 0;
@@ -769,7 +771,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -784,7 +786,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -800,7 +802,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -816,7 +818,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -832,7 +834,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -848,7 +850,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -864,7 +866,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -879,7 +881,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -894,7 +896,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);
@@ -929,7 +931,7 @@ instr_trace_t* Emulator::execute(const Instr &instr, uint32_t wid) {
           if (!warp.tmask.test(t))
             continue;
           uint64_t mem_addr = rs1_data[t].u;
-          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes};
+          trace_data->mem_addrs.at(t) = {mem_addr, data_bytes}; epoch_touch(mem_addr, data_bytes, true, true);
           uint64_t read_data = 0;
           this->dcache_read(&read_data, mem_addr, data_bytes);
           auto read_data_i = sext((WordI)read_data, data_width);

@@ -21,6 +21,8 @@ extern "C" uint64_t baseline_has_no_aq_window(void);
 LMEM_CHECK((TILE_A) * (SPLIT) * 4, (NASSUME) / (GLANES));
 #endif
 #include "../abl.h"
+#include "../probe_apply.h"
+#define PH_W ((phase_cycles_t*)a->phase_addr + (blk * (SPLIT) + sub))   // this warp's phase record (probes)
 
 static inline void gbarrier_ep(volatile uint32_t* bar, int slot, int tid, int NB, uint32_t ep) {
     if (tid % GLANES == 0) __atomic_fetch_add((uint32_t*)&bar[slot], 1, __ATOMIC_RELAXED);
@@ -144,15 +146,28 @@ static __attribute__((noinline)) uint32_t recv_count(const args_t* __UNIFORM__ a
     uint32_t msgs = 0;
 #if NOTILE
     // the owner's lcounts in memory, an L2 atomic per message
+#if PROBE_NOAPPLY
+    // measurement only: read every message, touch no state (the apply's cost = the normal run minus this one)
+    uint32_t s_ = 0;
+#define GCOUNT(x) { s_ ^= (uint32_t)(x); (void)lc; }
+#else
 #define GCOUNT(x) __atomic_fetch_add(&lc[x], 1u, __ATOMIC_RELAXED);
+#endif
 #if LANE_RECV
+    PA_DECL
+#define GCOUNT_P(x) PA_H(GCOUNT(x))
 #pragma GCC unroll 1
-    FOR_MY_LANE_QUEUES(o, t, 1u) { uint32_t* lc = cnt + (size_t)o * lnc; LANE_QUEUE(o, GCOUNT) }
+    FOR_MY_LANE_QUEUES(o, t, 1u) { uint32_t* lc = cnt + (size_t)o * lnc; LANE_QUEUE(o, GCOUNT_P) }
+#undef GCOUNT_P
+    PA_FLUSH(PH_W)
 #else
 #pragma GCC unroll 1
     FOR_MY_ACTORS(o) { uint32_t* lc = cnt + (size_t)o * lnc; WC_QUEUE(o, GCOUNT) }
 #endif
 #undef GCOUNT
+#if PROBE_NOAPPLY
+    if (s_ == 0x12345678u) cnt[0] = s_;
+#endif
     (void)T; (void)tile;
 #elif LANE_RECV
     // a lane per tile queue, counted into the lane's own KW-word scratchpad tile, written out by that lane
@@ -261,7 +276,13 @@ static __attribute__((noinline)) uint32_t recv_place(const args_t* __UNIFORM__ a
     uint32_t msgs = 0;
 #if NOTILE
     // the owner's wrkoff in memory: an L2 atomic per message takes the position
+    PA_DECL
+#if PROBE_NOAPPLY
+    uint64_t s_ = 0;   // measurement only, as recv_count
+#define GPLACE(x) { s_ ^= (uint64_t)(x); (void)wk; (void)lnz; }
+#else
 #define GPLACE(x) { lnz[__atomic_fetch_add(&wk[(x) & ((KW) - 1)], 1u, __ATOMIC_RELAXED)] = (int)((x) >> (TB)); }
+#endif
 #if LANE_RECV
 #pragma GCC unroll 1
     FOR_MY_LANE_QUEUES(o, t, 1u) {
@@ -272,7 +293,9 @@ static __attribute__((noinline)) uint32_t recv_place(const args_t* __UNIFORM__ a
         uint32_t* wk = (uint32_t*)a->wrk_addr + (size_t)o * lnc;
         int* lnz = (int*)a->tnz_addr + (size_t)o * tcap;
 #if LANE_RECV
-        LANE_QUEUE(o, GPLACE)
+#define GPLACE_P(x) PA_H(GPLACE(x))
+        LANE_QUEUE(o, GPLACE_P)
+#undef GPLACE_P
 #elif MSG64
         WC_QUEUE64(o, GPLACE)
 #else
@@ -280,6 +303,10 @@ static __attribute__((noinline)) uint32_t recv_place(const args_t* __UNIFORM__ a
 #endif
     }
 #undef GPLACE
+    PA_FLUSH(PH_W)
+#if PROBE_NOAPPLY
+    if (s_ == 0x123456789abcdefull) ((int*)a->tnz_addr)[0] = (int)s_;
+#endif
     (void)T; (void)tile;
 #elif LANE_RECV
     // a lane per tile queue: its own KW-word tile loaded with the offsets, positions taken from it
@@ -358,12 +385,24 @@ void kernel_body(args_t* __UNIFORM__ a) {
     vx_fence();
     gbarrier_ep(bar, 0, tid, NB, 1);                      // every warp has set the geometry
     const uint64_t t0 = csr_read(VX_CSR_MCYCLE);
+#if PROBE_TIMERS
+    uint64_t pt_s = 0, pt_r = 0, pt_ = 0;   // measurement only
+#define PT_S0 pt_ = csr_read(VX_CSR_MCYCLE);
+#define PT_S1 pt_s += csr_read(VX_CSR_MCYCLE) - pt_;
+#define PT_R0 pt_ = csr_read(VX_CSR_MCYCLE);
+#define PT_R1 pt_r += csr_read(VX_CSR_MCYCLE) - pt_;
+#else
+#define PT_S0
+#define PT_S1
+#define PT_R0
+#define PT_R1
+#endif
 #if ACTOR == 1
     // ---- phase 1: count the columns
-    send_count(a, (uint32_t)blk, sub, ln);
+    PT_S0 send_count(a, (uint32_t)blk, sub, ln); PT_S1
     vx_fence();
     gbarrier_ep(bar, 1, tid, NB, 1);
-    msgs += recv_count(a, (uint32_t)blk, sub, ln, tile);
+    PT_R0 msgs += recv_count(a, (uint32_t)blk, sub, ln, tile); PT_R1
     vx_fence();
     gbarrier_ep(bar, 2, tid, NB, 1);
 #if SWQ
@@ -384,10 +423,10 @@ void kernel_body(args_t* __UNIFORM__ a) {
     scan_round(a, (uint32_t)blk, sub, ln, ws);
     const uint64_t tb = csr_read(VX_CSR_MCYCLE);
     // ---- phase 2: place the nonzeros
-    send_place(a, (uint32_t)blk, sub, ln);
+    PT_S0 send_place(a, (uint32_t)blk, sub, ln); PT_S1
     vx_fence();
     gbarrier_ep(bar, 4, tid, NB, 1);
-    msgs += recv_place(a, (uint32_t)blk, sub, ln, tile);
+    PT_R0 msgs += recv_place(a, (uint32_t)blk, sub, ln, tile); PT_R1
     vx_fence();
     gbarrier_ep(bar, 5, tid, NB, 1);
 #if SWQ
@@ -453,6 +492,9 @@ void kernel_body(args_t* __UNIFORM__ a) {
     ph->p1 = ta - t0; ph->scan = tb - ta; ph->p2 = t1 - tb; ph->total = t1 - t0;
     PH_MSGS(ph, msgs);
     ph->t0 = t0; ph->t1 = t1;
+#if PROBE_TIMERS && ACTOR == 1
+    ph->snd = pt_s; ph->rcv = pt_r;
+#endif
 }
 
 int main(void) {

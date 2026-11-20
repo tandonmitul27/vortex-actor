@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <vortex.h>
 #include "common.h"
+#ifndef PROBE_NOAPPLY
+#define PROBE_NOAPPLY 0   // 1: measurement only, the receive skips the apply (results are not checked, counts are)
+#endif
 #ifndef ACTOR
 #define ACTOR 1
 #endif
@@ -187,7 +190,7 @@ int main(int argc, char** argv) {
                 << " first end=" << e0 << " last end=" << e1 << " max total=" << tmax << "\n"; }
     std::cout << "result: total_updates=" << (uint64_t)N*M << " errors=" << bad
               << " table_problems=" << tbad << "\n"
-              << ((bad==0 && tbad==0) ? "PASSED" : "FAILED") << "\n";
+              << (((bad==0 || PROBE_NOAPPLY) && tbad==0) ? "PASSED" : "FAILED") << "\n";
 #if BUCKET_TILE
     vx_mem_free(bsb); vx_mem_free(btb);
 #endif

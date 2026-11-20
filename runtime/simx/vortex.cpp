@@ -208,6 +208,8 @@ public:
       return err;
     });
     *dev_addr = addr;
+    // diagnostic (2026-11-16, Fig. 2b apply lines): VORTEX_ALLOC_LOG=1 prints each device allocation in order
+    if (getenv("VORTEX_ALLOC_LOG")) fprintf(stderr, "ALLOC 0x%lx 0x%lx\n", (unsigned long)addr, (unsigned long)asize);
 #ifdef VM_ENABLE
     // VM address translation
     phy_to_virt_map(asize, dev_addr, flags);

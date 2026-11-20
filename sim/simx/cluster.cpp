@@ -147,6 +147,8 @@ int Cluster::get_exitcode() const {
   return exitcode;
 }
 
+void epoch_barrier();   // processor.cpp diagnostic (VORTEX_EPOCH_RANGES)
+
 void Cluster::barrier(uint32_t bar_id, uint32_t count, uint32_t core_id) {
   auto& barrier = barriers_.at(bar_id);
 
@@ -171,6 +173,7 @@ void Cluster::barrier(uint32_t bar_id, uint32_t count, uint32_t core_id) {
         }
       }
       barrier.reset();
+      epoch_barrier();
     }
 }
 

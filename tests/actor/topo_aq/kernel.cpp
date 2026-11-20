@@ -20,6 +20,8 @@ extern "C" uint64_t baseline_has_no_aq_window(void);
 LMEM_CHECK((SPW) * (SPLIT) * 4, (NASSUME) / (GLANES));
 #endif
 #include "../abl.h"
+#include "../probe_apply.h"
+#define PH_W ((phase_cycles_t*)a->phase_addr + (blk * (SPLIT) + sub))   // this warp's phase record (probes)
 
 static inline void gbarrier_ep(volatile uint32_t* bar, int slot, int tid, int NB, uint32_t ep) {
 #if ISA2
@@ -144,6 +146,7 @@ static __attribute__((noinline)) uint64_t match_round(const args_t* __UNIFORM__ 
     const uint32_t* tnz = (const uint32_t*)a->tnz_addr;
     const uint32_t* toff0 = (const uint32_t*)a->toff_addr;
     uint32_t msgs = 0, sent = 0;
+    PA_DECL
     // MATCH handler: expand local column j of tmat, one DEC per nonzero row
 #if LANE_RECV
 #pragma GCC unroll 1
@@ -160,9 +163,11 @@ static __attribute__((noinline)) uint64_t match_round(const args_t* __UNIFORM__ 
 #endif
 #define MATCH(w) { const uint32_t c_ = ((w) << lnb) | o, e1_ = toff[(w) + 1]; \
     _Pragma("GCC unroll 1") for (uint32_t e_ = toff[w]; e_ < e1_; e_++) { const uint32_t rr_ = tnz[e_], i_ = rr_ >> lnb; \
-        aq_append32(N + (i_ >> tb) * N + (rr_ & (N - 1)), (msg_t)(i_ & tmask) | ((msg_t)c_ << tb)); sent++; } }
+        PA_S(aq_append32(N + (i_ >> tb) * N + (rr_ & (N - 1)), (msg_t)(i_ & tmask) | ((msg_t)c_ << tb))) sent++; } }
 #if LANE_RECV
-        LANE_RANGE(o, h, tl, MATCH)
+#define MATCH_P(w) PA_H(MATCH(w))
+        LANE_RANGE(o, h, tl, MATCH_P)
+#undef MATCH_P
 #else
         WC_RANGE(o, h, tl, MATCH, 1)
         PT2(1)
@@ -170,6 +175,7 @@ static __attribute__((noinline)) uint64_t match_round(const args_t* __UNIFORM__ 
 #undef MATCH
         heads[o] = tl;
     }
+    PA_FLUSH(PH_W)
     return ((uint64_t)msgs << 32) | sent;
 }
 static __attribute__((noinline)) uint64_t dec_round(const args_t* __UNIFORM__ a, uint32_t blk, uint32_t sub, uint32_t ln, uint32_t lv, uint64_t* pf) {
@@ -177,6 +183,7 @@ static __attribute__((noinline)) uint64_t dec_round(const args_t* __UNIFORM__ a,
     constexpr uint32_t N = NASSUME, tb = TB, tmask = (1u << TB) - 1u, lnb = LNB, lr = LR, ts = NT;
     uint32_t* heads = (uint32_t*)a->heads_addr;
     uint32_t msgs = 0, sent = 0;
+    PA_DECL
     // DEC handler: rowsum -= c, rowcnt--; a row reaching rowcnt 1 takes this level and sends its MATCH
 #if LANE_RECV
 #pragma GCC unroll 1
@@ -200,9 +207,11 @@ static __attribute__((noinline)) uint64_t dec_round(const args_t* __UNIFORM__ a,
     const uint32_t old_ = __atomic_fetch_add(&cn[i_], 0xffffffffu, __ATOMIC_RELAXED); \
     __atomic_fetch_sub(&sm[i_], c_, __ATOMIC_RELAXED); \
     if (old_ == 2) { const uint32_t s_ = ((volatile uint32_t*)sm)[i_]; const size_t x_ = (size_t)o * lr + i_; \
-        ((uint32_t*)a->mat_addr)[x_] = s_; ((uint32_t*)a->lev_addr)[x_] = lv; aq_append32(s_ & (N - 1), s_ >> lnb); sent++; } }
+        ((uint32_t*)a->mat_addr)[x_] = s_; ((uint32_t*)a->lev_addr)[x_] = lv; PA_S(aq_append32(s_ & (N - 1), s_ >> lnb)) sent++; } }
 #if LANE_RECV
-            LANE_RANGE(qi, h, tl, DEC)
+#define DEC_P(w) PA_H(DEC(w))
+            LANE_RANGE(qi, h, tl, DEC_P)
+#undef DEC_P
 #else
             WC_RANGE(qi, h, tl, DEC, WC_U)
             PT2(3)
@@ -211,6 +220,7 @@ static __attribute__((noinline)) uint64_t dec_round(const args_t* __UNIFORM__ a,
             heads[qi] = tl;
         }
     }
+    PA_FLUSH(PH_W)
     return ((uint64_t)msgs << 32) | sent;
 }
 // round 0: the rows with rowcnt 1 (level 0) send their MATCH
@@ -246,9 +256,19 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
 #else
 #define TICK(v)
 #endif
+    PA_W0
+#if ROUND1
+    const uint64_t r10_ = csr_read(VX_CSR_MCYCLE);
+#endif
     uint32_t sent = match0(a, blk, sub, ln);
     if (vx_vote_any((int)(sent != 0))) flag[0] = 1;
     vx_fence();
+    PA_W1(PH_W, pa_x)
+#if ROUND1
+    PH_W->r1 = csr_read(VX_CSR_MCYCLE) - r10_;           // probe: level 0's MATCH sends only
+    *epp = ep; *nrounds = 1; (void)bar; (void)tid; (void)NB; (void)prof;
+    return 0;
+#endif
     TICK(pd)
     BARRIER();
     TICK(pb)
@@ -257,7 +277,9 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
     for (; r < (uint32_t)(MAXR); r++) {
         if (flag[r - 1] == 0) break;                      // uniform: every thread reads the same flag
         if (blk == 0) aq_flush();                         // block-uniform: round r-1's partial lines
+        PA_W0
         const uint64_t rv = (r & 1) ? match_round(a, blk, sub, ln, prof + 3) : dec_round(a, blk, sub, ln, r >> 1, prof + 3);
+        PA_W1(PH_W, pa_r)
         msgs += rv >> 32;
         if (r & 1) { TICK(pm) } else { TICK(pd) }
         if (vx_vote_any((int)((uint32_t)rv != 0))) flag[r] = 1;
@@ -360,6 +382,7 @@ static __attribute__((noinline)) uint64_t recv_cperm(const args_t* __UNIFORM__ a
     const uint32_t lrows = a->lrows, n = a->numrows, ts = a->ntile;
     uint32_t* cperm = (uint32_t*)a->cperm_addr;
     uint64_t msgs = 0;
+    PA_DECL
 #if NOTILE
     // cperm[j] = rperm in memory (a plain store per message: each column is placed once)
 #if LANE_RECV
@@ -373,13 +396,16 @@ static __attribute__((noinline)) uint64_t recv_cperm(const args_t* __UNIFORM__ a
         const uint32_t qi = N + o;
 #define CPERM(x) { cp[(x) & tmask] = (x) >> tb; }
 #if LANE_RECV
-        LANE_RANGE(qi, 0u, QCOUNT(qi), CPERM)
+#define CPERM_P(x) PA_H(CPERM(x))
+        LANE_RANGE(qi, 0u, QCOUNT(qi), CPERM_P)
+#undef CPERM_P
 #else
         WC_RANGE(qi, 0u, QCOUNT(qi), CPERM, WC_U)
 #endif
 #undef CPERM
     }
     (void)tile; (void)ts;
+    PA_FLUSH(PH_W)
 #elif LANE_RECV
     // a lane per column tile queue, its own KW-word tile, written out by that lane
     uint32_t* lt = tile + ln * (uint32_t)(KW);
@@ -458,6 +484,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
     if (blk == 0) aq_round();                             // block-uniform: empty the queues for phase 2
 #endif
     const uint64_t ta = csr_read(VX_CSR_MCYCLE);
+#if !ROUND1
     // ---- phase 2: positions by level, then cperm by message
     level_hist(a, ub, sub, ln, tile, levels);
     vx_fence();
@@ -465,13 +492,18 @@ void kernel_body(args_t* __UNIFORM__ a) {
     level_prefix(a, wi, ln, ws, levels);
     vx_fence();
     BARRIER();
+    { PA_W0
     send_cperm(a, ub, sub, ln, tile, levels);
     vx_fence();
+    PA_W1(PH_W, pa_x) }
     BARRIER();
     if (blk == 0) aq_flush();                             // block-uniform: the CPERM partial lines
+    { PA_W0
     msgs += recv_cperm(a, ub, sub, ln, tile);
     vx_fence();
+    PA_W1(PH_W, pa_r) }
     BARRIER();
+#endif
 #else
     // ---- toposort_matrix_agi, one PE: a thread per queued row, grid stride, level by level
     const uint32_t n = a->numrows;

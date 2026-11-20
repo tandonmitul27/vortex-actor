@@ -212,10 +212,22 @@ static __attribute__((noinline)) void send_round(uint32_t me, uint32_t NB, uint3
           for (uint32_t u = 0; u < (uint32_t)(UNROLL); u++) {
               const uint32_t b = g[u] / (uint32_t)(NASSUME);
               qq[u] = bqid_of(b / (uint32_t)BTILE_SZ, g[u] % (uint32_t)(NASSUME), (uint32_t)(NASSUME));
+#if PROBE_SEND   // PROBE ONLY (motivation, fails the check), as swq.h: shadow tails, every queue stays empty
+              __asm__ volatile("" :: "r"(qq[u]), "r"(g[u]));   // the message is still formed
+#if PROBE_SEND == 1
+              __asm__ volatile("amoadd.w zero, %1, (%0)" :: "r"((uint32_t*)g_swq_st + qq[u]), "r"(1u) : "memory");
+#elif PROBE_SEND == 2
+              { const uint32_t t_ = __atomic_fetch_add((uint32_t*)g_swq_st + qq[u], 1u, __ATOMIC_RELAXED);
+                __asm__ volatile("add zero, %0, zero" :: "r"(t_)); }
+#endif
+              (void)sl;
+          }
+#else
               sl[u] = __atomic_fetch_add(&g_swq_tl[qq[u]], 1u, __ATOMIC_RELAXED);
           }
           for (uint32_t u = 0; u < (uint32_t)(UNROLL); u++)
               if (sl[u] < g_swq_cap) g_swq_st[(size_t)qq[u] * g_swq_stride + sl[u]] = (int)(g[u] / (uint32_t)(NASSUME));
+#endif
         }
         if (0)
 #endif
@@ -465,7 +477,14 @@ static __attribute__((noinline)) void recv_run(const int* q, uint32_t tail, int*
 // Same, but straight into my own counts in memory, which is the only option
 // once L * GLANES exceeds the scratchpad.
 static __attribute__((noinline)) void recv_mem(const int* q, uint32_t tail, int* mine) {
+#if PROBE_NOAPPLY
+    // measurement only: read every message, touch no state (the apply's cost = the normal run minus this one)
+    int s_ = 0;
+    for (uint32_t i = 0; i < tail; i++) s_ += q[QIX_(q, i)];
+    if (s_ == 0x7fffffff) mine[0] = s_;
+#else
     for (uint32_t i = 0; i < tail; i++) mine[q[QIX_(q, i)]]++;
+#endif
 }
 #endif
 #if BUCKET_TILE
@@ -712,6 +731,14 @@ void kernel_body(args_t* __UNIFORM__ a) {
 #elif TILE_ACC
           tile_apply(QPTR_(bs, BQ_STRIDE_W, bid), tail, acc, t * (uint32_t)BTILE_SZ,
                      counts + (size_t)me * L + (size_t)t * BTILE_SZ);
+#elif PROBE_LIVE
+          // MEASUREMENT ONLY (motivation, live state): PROBE_LIVE lanes of the warp drain at a time, the others
+          // take turns with an empty range, so fewer owners' counts are updated at once. Off = identical binary.
+#pragma GCC unroll 1
+          for (uint32_t g_ = 0; g_ < (uint32_t)(NUM_THREADS) / (uint32_t)(PROBE_LIVE); g_++)
+              recv_mem(QPTR_(bs, BQ_STRIDE_W, bid),
+                       ((uint32_t)tid % (uint32_t)(NUM_THREADS)) / (uint32_t)(PROBE_LIVE) == g_ ? tail : 0u,
+                       counts + (size_t)me * L);
 #else
           recv_mem(QPTR_(bs, BQ_STRIDE_W, bid), tail, counts + (size_t)me * L);
 #endif

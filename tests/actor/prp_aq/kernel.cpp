@@ -219,11 +219,22 @@ static __attribute__((noinline)) uint32_t srv_round(const args_t* __UNIFORM__ a,
     const uint64_t* ctab = (const uint64_t*)a->rqctab_addr;
     const uint32_t maxc = a->rq_maxc, lr = a->lrows, lrs = lr + 1, T = a->nrq;
     uint32_t msgs = 0;
+    uint64_t s_ = 0; (void)s_;
+#if PROBE_NOAPPLY
+#define SV_F(sx_) ((void)ao, (void)lpr, (double)(sx_))   // measurement only: no read of the owner's state
+#else
+#define SV_F(sx_) (lpr[sx_] / (double)(ao[sx_ + 1] - ao[sx_]))
+#endif
+#if PROBE_NOREPLY
+#define SV_SEND(q_, m_) { s_ ^= (uint64_t)(q_) ^ (m_); }    // measurement only: no reply sent
+#else
+#define SV_SEND(q_, m_) aq_append64(q_, m_);
+#endif
 #define SERVE(w) { const uint32_t sw_ = (uint32_t)(w), sx_ = xb + (sw_ & ((RQ_W) - 1)); \
-    const double sf_ = lpr[sx_] / (double)(ao[sx_ + 1] - ao[sx_]); \
+    const double sf_ = SV_F(sx_); \
     const uint32_t sy_ = (sw_ >> (RB)) & ((1u << (YB)) - 1u); \
-    aq_append64((sy_ >> (TB)) * (uint32_t)(NASSUME) + (sw_ >> (32 - (LNB))), \
-                ((as_u64(sf_) + (1ull << ((TB) - 1))) & ~(uint64_t)((KW) - 1)) | (sy_ & ((KW) - 1))); }
+    SV_SEND((sy_ >> (TB)) * (uint32_t)(NASSUME) + (sw_ >> (32 - (LNB))), \
+            ((as_u64(sf_) + (1ull << ((TB) - 1))) & ~(uint64_t)((KW) - 1)) | (sy_ & ((KW) - 1))) }
 #if LANE_RECV
 #pragma GCC unroll 1
     FOR_MY_LANE_QUEUES(o, t, T) {
@@ -245,6 +256,9 @@ static __attribute__((noinline)) uint32_t srv_round(const args_t* __UNIFORM__ a,
     }
 #endif
 #undef SERVE
+#undef SV_F
+#undef SV_SEND
+    if (s_ == 0x123456789abcdefull) ((volatile uint64_t*)a->pr_addr)[0] = s_;
     return msgs;
 }
 // RESPONSE handler (curr[y] += prf): per row tile queue, added into the warp's scratchpad tile (amocas loops),
@@ -261,7 +275,12 @@ static __attribute__((noinline)) uint32_t rep_round(const args_t* __UNIFORM__ a,
     double e = 0;
 #if NOTILE
     // curr in memory, an L2 amocas loop per message; then the update over the actor's rows
+#if PROBE_NOAPPLY
+    uint64_t s2_ = 0;
+#define GADD(x) { s2_ ^= (uint64_t)(x); }                   // measurement only: no add to the owner's state
+#else
 #define GADD(x) atomic_add_f64((volatile uint64_t*)&lc[(x) & ((KW) - 1)], as_f64((x) & ~(uint64_t)((KW) - 1)));
+#endif
 #if LANE_RECV
 #pragma GCC unroll 1
     FOR_MY_LANE_QUEUES(o, t, 1u) {
@@ -286,6 +305,9 @@ static __attribute__((noinline)) uint32_t rep_round(const args_t* __UNIFORM__ a,
     }
 #endif
 #undef GADD
+#if PROBE_NOAPPLY
+    if (s2_ == 0x123456789abcdefull) ((volatile uint64_t*)a->cur_addr)[0] = s2_;
+#endif
     (void)T; (void)tile;
 #elif LANE_RECV
     // a lane per row tile queue, added into the lane's own KW-double tile, written out by that lane (update fused)
@@ -405,7 +427,12 @@ void kernel_body(args_t* __UNIFORM__ a) {
 #pragma GCC unroll 1
         for (uint32_t k = 0; k < nw; k++) err += wsum[k];
         cq += ta - ts; cs += tb - ta;
+#if PROBE_NOAPPLY || PROBE_NOREPLY || PROBE_SEND
+        (void)err;   // measurement only: stop after the normal run's iteration count (PROBE_ITERS)
+        if (it == (uint32_t)(PROBE_ITERS)) { cr += csr_read(VX_CSR_MCYCLE) - tb; break; }
+#else
         if (err < (ERR_DELTA)) { cr += csr_read(VX_CSR_MCYCLE) - tb; break; }
+#endif
         copy_round(a, (uint32_t)blk, sub, ln);            // my actors' rows only: the next serve (after a barrier) reads them
         cr += csr_read(VX_CSR_MCYCLE) - tb;
     }

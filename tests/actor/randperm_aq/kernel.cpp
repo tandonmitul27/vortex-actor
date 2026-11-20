@@ -20,6 +20,8 @@ extern "C" uint64_t baseline_has_no_aq_window(void);
 LMEM_CHECK((TILE0) ? (SPW) * (SPLIT) * 4 : 0, NBLK);   // TILE0=0 allocates no tile
 #endif
 #include "../abl.h"
+#include "../probe_apply.h"
+#define PH_W ((phase_cycles_t*)a->phase_addr + (blk * (SPLIT) + sub))   // this warp's phase record (probes)
 
 static inline void gbarrier_ep(volatile uint32_t* bar, int slot, int tid, int NB, uint32_t ep) {
 #if ISA2
@@ -171,6 +173,10 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
 #define THROW(o, j, k) { const uint32_t r_ = rp_slot((j) * (uint32_t)(NASSUME) + (o), (k), seed, M), sl_ = r_ >> (AB); \
     aq_appendm((sl_ >> tbs) * (uint32_t)(NASSUME) + (r_ & ((NASSUME) - 1)), ((msg_t)(o) << ssh) | ((msg_t)(j) << tbs) | (sl_ & tmask)); \
     nthrown++; }
+    PA_DECL
+#if PROBE_APPLYT || ROUND1
+    const uint64_t r10_ = csr_read(VX_CSR_MCYCLE);
+#endif
     // round 0's throws: every dart
 #pragma GCC unroll 1
     FOR_MY_ACTORS(o) {
@@ -178,11 +184,22 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
         for (uint32_t j = ln; j < lN; j += GLANES) THROW(o, j, 0u)
     }
     vx_fence();
+#if PROBE_APPLYT
+    PH_W->pa_x += csr_read(VX_CSR_MCYCLE) - r10_;
+#endif
+#if ROUND1
+    PH_W->r1 = csr_read(VX_CSR_MCYCLE) - r10_;            // probe: round 0's throws only
+    *epp = ep; *thrown += nthrown; (void)bar; (void)tid; (void)NB; (void)rounds; (void)tile; (void)prof; (void)heads; (void)fails;
+    return msgs;
+#endif
     TICK(pr0)
     BARRIER();
     TICK(pr4)
 #pragma GCC unroll 1
     for (uint32_t k = 0; k < (uint32_t)(MAXR); k++) {
+#if PROBE_APPLYT
+        const uint64_t rs0_ = csr_read(VX_CSR_MCYCLE);
+#endif
         // THROW handler: claim the slot if it is empty, REPLY {landed | dart} to the sender
 #if LANE_RECV
         // a lane per (owner, slot tile) queue
@@ -215,8 +232,10 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
                 volatile uint32_t* sl = (volatile uint32_t*)a->tgt_addr + (size_t)o * lM + (t << tbs);
 #define SERVE(w) { const uint32_t j_ = ((w) >> tbs) & jmask, s_ = (w) >> ssh; \
     const uint32_t won_ = amocas32(&sl[(w) & tmask], EMPTY, j_ * (uint32_t)(NASSUME) + s_) == EMPTY; \
-    aq_appendm(rbase + s_, (won_ << 31) | j_); }
-                LANE_RANGE(qi, h, tl, SERVE)
+    PA_S(aq_appendm(rbase + s_, (won_ << 31) | j_)) }
+#define SERVE_P(w) PA_H(SERVE(w))
+                LANE_RANGE(qi, h, tl, SERVE_P)
+#undef SERVE_P
 #undef SERVE
                 heads[qi] = tl;
             }
@@ -307,6 +326,10 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
 #endif
         }
 #endif
+#if PROBE_APPLYT
+        PA_FLUSH(PH_W)
+        PH_W->pa_r += csr_read(VX_CSR_MCYCLE) - rs0_;
+#endif
         vx_fence();
 #if PROF
         if (k == 0) TICK(pr1) else TICK(pr2)
@@ -315,12 +338,17 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
         TICK(pr4)
         // REPLY handler: a landed dart is done; a failed one is thrown again at once (its (k+1)-th throw)
         uint32_t nf = 0;
+#if PROBE_APPLYT
+        const uint64_t rr0_ = csr_read(VX_CSR_MCYCLE);
+#endif
 #if LANE_RECV
 #pragma GCC unroll 1
         FOR_MY_LANE_QUEUES_RP(o, t, 1u) {
             const uint32_t qi = rbase + o, h = heads[qi], tl = QCOUNT(qi);
 #define REPLY(w) { if (!((w) >> 31)) { const uint32_t j_ = (w) & jmask; THROW(o, j_, k + 1) nf++; } }
-            LANE_RANGE(qi, h, tl, REPLY)
+#define REPLY_P(w) PA_H(PA_S(REPLY(w)))   // the reply handler applies nothing: a failed dart is thrown again
+            LANE_RANGE(qi, h, tl, REPLY_P)
+#undef REPLY_P
 #else
 #pragma GCC unroll 1
         FOR_MY_ACTORS(o) {
@@ -332,6 +360,10 @@ static __attribute__((noinline)) uint64_t phase1(const args_t* __UNIFORM__ a, ui
             heads[qi] = tl;
         }
         if (nf) __atomic_fetch_add((uint32_t*)&fails[k], nf, __ATOMIC_RELAXED);
+#if PROBE_APPLYT
+        PA_FLUSH(PH_W)
+        PH_W->pa_r += csr_read(VX_CSR_MCYCLE) - rr0_;
+#endif
         vx_fence();
         TICK(pr3)
         BARRIER();
@@ -424,6 +456,7 @@ static __attribute__((noinline)) uint32_t recv_perm(const args_t* __UNIFORM__ a,
     QUEUE_STATE32
     constexpr uint32_t lN = LN;
     uint32_t msgs = 0;
+    PA_DECL
 #if LANE_RECV
     // a lane per queue: the whole queue copied by that lane, in arrival order
 #pragma GCC unroll 1
@@ -431,9 +464,12 @@ static __attribute__((noinline)) uint32_t recv_perm(const args_t* __UNIFORM__ a,
         uint32_t* lp = (uint32_t*)a->perm_addr + (size_t)o * lN;
         uint32_t pos = 0;
 #define PUT(x) { lp[pos++] = (x); }
-        LANE_RANGE(o, 0u, QCOUNT(o), PUT)
+#define PUT_P(x) PA_H(PUT(x))
+        LANE_RANGE(o, 0u, QCOUNT(o), PUT_P)
+#undef PUT_P
 #undef PUT
     }
+    PA_FLUSH(PH_W)
     (void)ctab; (void)maxc;
     return msgs;
 #endif
@@ -511,17 +547,22 @@ void kernel_body(args_t* __UNIFORM__ a) {
 #endif
 #endif
     const uint64_t ta = csr_read(VX_CSR_MCYCLE);
+#if !ROUND1
     // ---- phase 2: pack my filled slots, send the i-th to PE (offset + i) % P
 #if !CNTW
     count_round(a, ub, sub, ln, ws);
     vx_fence();
     BARRIER();
 #endif
+    { PA_W0
     send_perm(a, ub, sub, ln, ws);
     vx_fence();
+    PA_W1(PH_W, pa_x) }
     BARRIER();
+    { PA_W0
     msgs += recv_perm(a, ub, sub, ln);
     vx_fence();
+    PA_W1(PH_W, pa_r) }
     BARRIER();
 #if SWQ
     swq_round(a->rbase + a->N, wi * GLANES + ln, (uint32_t)NB * (SPLIT) * GLANES);
@@ -530,6 +571,7 @@ void kernel_body(args_t* __UNIFORM__ a) {
 #endif
     vx_fence();
     BARRIER();
+#endif
 #else
     // ---- copied_rand_permp_agi, one PE: a thread per item, grid stride
     volatile uint32_t* tgt = (volatile uint32_t*)a->tgt_addr;

@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // Triangle counting, after bale-gpu (src/trianglecounting-*.cu) and the HClib-Actor selector version.
 // Input: a Matrix Market file holding L, the lower triangular adjacency matrix (TC_MTX env), read as
 // bale-gpu reads it. Rows are distributed cyclically: row r belongs to PE r % P at local row r / P, and
@@ -99,14 +102,18 @@
 #if RTILE && (ACTOR != 1 || MSG32 || BAL)
 #error "RTILE needs ACTOR 1, without MSG32 and BAL"
 #endif
-#define TS_W       1024     // RTILE: scratchpad words per warp (one tile)
+#ifndef TS_W
+#define TS_W       1024     // RTILE: scratchpad words per warp (one tile); sensitivity runs set it to the warp's scratchpad share
+#endif
 // Ablation (results/mapping/ABLATION.md, ../abl.h): piece B off = RTILE=0 (one queue per owner, binary search in
 // memory); piece C off = LANE_RECV=1: a lane takes a whole tile queue, with its own TS_W / 16-slot hash set (the
 // host cuts HMAX-edge tiles for it: the generator passes a 16x smaller HMAX), so the lmap row field is 4 bits.
 #ifndef LANE_RECV
 #define LANE_RECV  0
 #endif
-#define HS_B       ((LANE_RECV) ? 6 : 10)   // log2(HS)
+#ifndef HS_B
+#define HS_B       ((LANE_RECV) ? 6 : 10)   // log2(HS); sensitivity runs with a smaller TS_W shrink it to fit
+#endif
 #define HS         (1u << (HS_B))           // RTILE 2/3: hash slots per tile (per lane under LANE_RECV)
 #define LMB        ((LANE_RECV) ? 4u : 10u) // lmap: bits of the in-tile row (the queue above it)
 #define HS_EMPTY   0xFFFFFFFFu
@@ -114,6 +121,7 @@
 #define HMAX       ((HS) / 2)   // RTILE=2: edges per tile at most (load factor HMAX / HS)
 #endif
 static_assert((HMAX) < (HS), "HMAX: a tile's hash set needs an empty slot");
+static_assert(!(RTILE) || (LANE_RECV) || (HS) <= (TS_W), "HS: a warp's hash set must fit its TS_W-word scratchpad tile");
 #ifndef HSIZE
 #define HSIZE      0
 #endif
@@ -142,7 +150,7 @@ static_assert((HMAX) < (HS), "HMAX: a tile's hash set needs an empty slot");
 #error "HSIZE and HADAPT need RTILE 3"
 #endif
 #define HS_HASH(k) (((uint32_t)(k) * 0x9E3779B1u) >> (32 - (HS_B)))
-static_assert(!(RTILE) || (SPLIT) * (TS_W) * 4 <= 16384, "the warps' tiles exceed the scratchpad");
+static_assert(!(RTILE) || (SPLIT) * (TS_W) * 4 <= (LMEM_BYTES), "the warps' tiles exceed the scratchpad");
 #ifndef Q_CAP
 #define Q_CAP      ((RTILE) ? 1024 : 4096)     // per-queue region (messages); the rest overflows into pool chunks
 #endif

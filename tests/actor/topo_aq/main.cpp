@@ -193,6 +193,14 @@ int main() {
                          << " m_state=" << (uint64_t)(sp[3] / nwarps) << " m_drain=" << (uint64_t)(sp[4] / nwarps)
                          << " d_state=" << (uint64_t)(sp[5] / nwarps) << " d_drain=" << (uint64_t)(sp[6] / nwarps);
     std::cout << "\n";
+#if PROBE_APPLYT
+    { double h = 0, s = 0, r = 0, x = 0; for (auto& y : ph) { h += y.pa_h; s += y.pa_s; r += y.pa_r; x += y.pa_x; }
+      std::cout << "probe apply (mean per warp): handler=" << (uint64_t)(h / nwarps) << " hsend=" << (uint64_t)(s / nwarps)
+                << " recv=" << (uint64_t)(r / nwarps) << " send=" << (uint64_t)(x / nwarps) << " total=" << (uint64_t)(st / nwarps) << "\n"; }
+#endif
+#if ROUND1
+    { double r1 = 0; for (auto& y : ph) r1 += y.r1; std::cout << "probe round1 send=" << (uint64_t)(r1 / nwarps) << "\n"; }
+#endif
     std::vector<uint32_t> rperm(n), cperm(n);
     for (uint32_t r = 0; r < n; r++) { rperm[r] = drp[(size_t)(r % P) * lrows + r / P]; cperm[r] = dcp[(size_t)(r % P) * lrows + r / P]; }
     bool perm_ok = true;

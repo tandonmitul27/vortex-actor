@@ -159,8 +159,24 @@ static __attribute__((noinline)) uint32_t recv_round(const args_t* __UNIFORM__ a
     uint32_t msgs = 0;
 #if NOTILE
     // curr in memory, an L2 amocas loop per message
+#if PROBE_NOAPPLY
+    // measurement only: read every message, touch no state (the apply's cost = the normal run minus this one)
+    uint64_t s_ = 0;
+#define GADD(x) { s_ ^= (uint64_t)(x); (void)lc; }
+#else
 #define GADD(x) atomic_add_f64((volatile uint64_t*)&lc[(x) & ((KW) - 1)], as_f64((x) & ~(uint64_t)((KW) - 1)));
-#if LANE_RECV
+#endif
+#if LANE_RECV && PROBE_LIVE
+    // MEASUREMENT ONLY (motivation, live state): FOR_MY_LANE_QUEUES(o, t, 1) with PROBE_LIVE lanes of the warp
+    // draining at a time, the others taking turns with an empty range, so fewer owners' rows are updated at once.
+#pragma GCC unroll 1
+    for (uint32_t g_ = 0; g_ < (uint32_t)(NUM_THREADS) / (uint32_t)(PROBE_LIVE); g_++)
+#pragma GCC unroll 1
+    for (uint32_t qi_ = ln + ((ln % (uint32_t)(NUM_THREADS)) / (uint32_t)(PROBE_LIVE) == g_ ? 0u : (uint32_t)(OW));
+         qi_ < (uint32_t)(OW); qi_ += GLANES) {
+        const uint32_t o = blk * GLANES + sub + qi_ * (SPLIT);
+        double* lc = (double*)a->cur_addr + (size_t)o * lr; LANE_QUEUE(o, GADD) }
+#elif LANE_RECV
 #pragma GCC unroll 1
     FOR_MY_LANE_QUEUES(o, t, 1u) { double* lc = (double*)a->cur_addr + (size_t)o * lr; LANE_QUEUE(o, GADD) }
 #else
@@ -168,6 +184,9 @@ static __attribute__((noinline)) uint32_t recv_round(const args_t* __UNIFORM__ a
     FOR_MY_ACTORS(o) { double* lc = (double*)a->cur_addr + (size_t)o * lr; WC_QUEUE(o, GADD) }
 #endif
 #undef GADD
+#if PROBE_NOAPPLY
+    if (s_ == 0x123456789abcdefull) ((volatile uint64_t*)a->cur_addr)[0] = s_;
+#endif
     (void)T; (void)tile;
 #elif LANE_RECV
     // a lane per tile queue, added into the lane's own KW-double tile, written out by that lane
@@ -296,7 +315,12 @@ void kernel_body(args_t* __UNIFORM__ a) {
 #pragma GCC unroll 1
         for (uint32_t k = 0; k < nw; k++) err += wsum[k];
         cs += ta - ts; cr += tb - ta;
+#if PROBE_NOAPPLY || PROBE_SEND
+        (void)err;   // measurement only: stop after the normal run's iteration count (PROBE_ITERS)
+        if (it == (uint32_t)(PROBE_ITERS)) { cu += csr_read(VX_CSR_MCYCLE) - tb; break; }
+#else
         if (err < (ERR_DELTA)) { cu += csr_read(VX_CSR_MCYCLE) - tb; break; }
+#endif
         copy_round(a, (uint32_t)blk, sub, ln);            // my actors' rows only: the next send reads only them
         cu += csr_read(VX_CSR_MCYCLE) - tb;
     }

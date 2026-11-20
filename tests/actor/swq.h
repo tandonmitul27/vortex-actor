@@ -17,7 +17,28 @@ static inline void swq_geometry(uint64_t qbase, uint64_t qstride, uint64_t tailb
 static inline void swq_pool(uint64_t pool, uint64_t ctab, uint32_t maxc, uint32_t nch, uint64_t next) {
     g_sq_pool = (char*)pool; g_sq_ctab = (uint64_t*)ctab; g_sq_maxc = maxc; g_sq_nch = nch; g_sq_next = (uint32_t*)next;
 }
+#ifndef PROBE_SEND
+#define PROBE_SEND 0
+#endif
+#if PROBE_SEND
+// PROBE ONLY (motivation, fails the check): a send without some of its parts. The atomic goes to a
+// shadow tail per queue at the start of the queue region, so the real tails stay 0 and every queue
+// stays empty, and the message is still formed. 1 = the atomic only, its result unused (rd = x0, the lane never waits for it);
+// 2 = the atomic only, waited for (the lane uses its result); 3 = no send at all.
+static inline void swq_probe_send(uint32_t* sh, uint64_t w) {
+    __asm__ volatile("" :: "r"(sh), "r"(w));   // the message is still formed
+#if PROBE_SEND == 1
+    __asm__ volatile("amoadd.w zero, %1, (%0)" :: "r"(sh), "r"(1u) : "memory");
+#elif PROBE_SEND == 2
+    const uint32_t t_ = __atomic_fetch_add(sh, 1u, __ATOMIC_RELAXED);
+    __asm__ volatile("add zero, %0, zero" :: "r"(t_));
+#endif
+}
+#endif
 static inline void swq_put(uint32_t q, uint64_t w) {
+#if PROBE_SEND
+    swq_probe_send((uint32_t*)g_sq_qb + q, w); return;
+#endif
     const uint32_t t = __atomic_fetch_add(&g_sq_tl[q], 1u, __ATOMIC_RELAXED);
     char* p;
     if (t < g_sq_cap) {

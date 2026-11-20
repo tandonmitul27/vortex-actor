@@ -131,6 +131,15 @@ int main() {
     for (auto& x : ph) { s1 += x.p1; ss += x.scan; s2 += x.p2; st += x.total; tmax = std::max(tmax, x.total); recvd += x.msgs; }
     std::cout << "phases (mean cycles/actor): p1=" << (uint64_t)(s1 / nwarps) << " scan=" << (uint64_t)(ss / nwarps)
               << " p2=" << (uint64_t)(s2 / nwarps) << " total=" << (uint64_t)(st / nwarps) << " max_total=" << tmax << "\n";
+#if PROBE_TIMERS
+    { double ps = 0, pr = 0; for (auto& x : ph) { ps += x.snd; pr += x.rcv; }
+      std::cout << "probe timers (mean per warp): send=" << (uint64_t)(ps / nwarps) << " recv=" << (uint64_t)(pr / nwarps) << "\n"; }
+#endif
+#if PROBE_APPLYT
+    { double h = 0, s = 0; for (auto& x : ph) { h += x.pa_h; s += x.pa_s; }
+      std::cout << "probe apply (mean per warp): handler=" << (uint64_t)(h / nwarps) << " hsend=" << (uint64_t)(s / nwarps)
+                << " total=" << (uint64_t)(st / nwarps) << "\n"; }
+#endif
     uint64_t badoff = 0, badrow = 0;
     std::vector<int> got;
     for (uint32_t c = 0; c < n; c++) {
@@ -148,7 +157,7 @@ int main() {
         got.assign(seg + s, seg + e); std::sort(got.begin(), got.end());
         if (!std::equal(got.begin(), got.end(), tnzref.begin() + tref[c])) badrow++;
     }
-    const bool ok = badoff == 0 && badrow == 0 && (!ACTOR || recvd == 2ull * nnz);
+    const bool ok = ((badoff == 0 && badrow == 0) || PROBE_NOAPPLY) && (!ACTOR || recvd == 2ull * nnz);
     std::cout << "validation: rows of At with wrong offsets " << badoff << ", wrong contents " << badrow << " of " << n;
     if (ACTOR) std::cout << ", messages received " << recvd << " of " << 2ull * nnz;
     std::cout << "\n";

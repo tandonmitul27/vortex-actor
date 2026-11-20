@@ -292,10 +292,16 @@ static __attribute__((noinline)) uint32_t recv_hash_l(const msg_t* q, uint32_t t
 static __attribute__((noinline)) uint32_t recv_actor_l(const msg_t* q, uint32_t tl, const uint64_t* cr,
                                                        const int* loffset, const int* lnonzero) {
     uint32_t c = 0;
+#if PROBE_NOAPPLY
+    // measurement only: read every message, touch no state (the apply's cost = the normal run minus this one)
+    (void)loffset; (void)lnonzero;
+#define TC_PROCESS(w) { c += (uint32_t)(w) & 1u; }
+#else
 #define TC_PROCESS(w) { TC_DECODE(w) \
     const int* nbrV = &lnonzero[loffset[v_local]]; \
     const int nbrV_size = loffset[v_local + 1] - loffset[v_local]; \
     c += (uint32_t)binary_search(nbrV, 0, nbrV_size - 1, w_global); }
+#endif
     LANE_Q(q, tl, cr, TC_PROCESS)
 #undef TC_PROCESS
     return c;
@@ -1019,6 +1025,19 @@ void kernel_body(args_t* __UNIFORM__ a) {
             tri += recv_hash_l(q, tl, cr, lT);
         }
     }
+#elif PROBE_LIVE
+    // MEASUREMENT ONLY (motivation, live state): PROBE_LIVE lanes of the warp drain at a time, the others take
+    // turns with an empty range, so fewer owners' adjacency is searched at once. Off = identical binary.
+#pragma GCC unroll 1
+    for (uint32_t g_ = 0; g_ < (uint32_t)(NUM_THREADS) / (uint32_t)(PROBE_LIVE); g_++) {
+#pragma GCC unroll 1
+    for (uint32_t k = ln + ((ln % (uint32_t)(NUM_THREADS)) / (uint32_t)(PROBE_LIVE) == g_ ? 0u : (uint32_t)(OW));
+         k < (uint32_t)(OW); k += GLANES) {
+        const uint32_t o = (uint32_t)blk * GLANES + sub + k * (SPLIT);
+        const uint32_t tl = QCOUNT(o);
+        msgs += tl;
+        tri += recv_actor_l(QPTR_(qs, QSTRIDE_E, o), tl, ctab + (size_t)o * a->ovf_maxc, loffset + (size_t)o * lrs, lnonzero);
+    } }
 #else
 #pragma GCC unroll 1
     for (uint32_t k = ln; k < (uint32_t)(OW); k += GLANES) {

@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // actor_ig_aq: Bale index gather on a combining append queue (HW-SW co-design
 // ladder step 2). See docs/append_queue_plan.md.
 //

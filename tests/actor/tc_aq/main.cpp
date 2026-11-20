@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <vortex.h>
 #include "common.h"
+#ifndef PROBE_NOAPPLY
+#define PROBE_NOAPPLY 0   // 1: measurement only, the receive skips the apply (results are not checked, counts are)
+#endif
 #include "../isa2.h"
 
 struct Coo { int row, col; };
@@ -414,7 +417,7 @@ int main() {
               << " max_send=" << smax << " max_recv=" << rmax;
     if (ACTOR == 4) std::cout << " serve=" << (uint64_t)(sv / nph);
     std::cout << "\n";
-    const bool ok = got == ref && (!MSG || recvd == nmsg);
+    const bool ok = (got == ref || PROBE_NOAPPLY) && (!MSG || recvd == nmsg);
     std::cout << "validation: triangles " << got << " of " << ref;
     if (MSG) std::cout << ", messages received " << recvd << " of " << nmsg;
     std::cout << "\n";

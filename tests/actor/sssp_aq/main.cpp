@@ -77,6 +77,11 @@ int main() {
     uint64_t exm, rdm; uint32_t exr, rdr;
     bf(false, ex, nullptr, exm, exr);
     if (ACTOR) bf(true, rd, &per_q, rdm, rdr);
+#if ROUND1
+    std::fill(per_q.begin(), per_q.end(), 0);   // probe: round 0 only, every vertex sends over each out-edge
+    for (uint32_t v = 0; v < n; v++)
+        for (uint32_t e = rp[v]; e < rp[v + 1]; e++) { const uint32_t w = cols[e]; per_q[((size_t)(NT) + (w / N) / (KW)) * N + w % N]++; }
+#endif
     uint64_t reached = 0; double dmax = 0;
     for (auto t : ex) if (t != SS_INF) { reached++; dmax = std::max(dmax, as_f64(t)); }
     uint64_t need = 0, maxc = 0, qmax = 0;
@@ -156,6 +161,14 @@ int main() {
     std::cout << "phases (mean cycles/actor): drain=" << (uint64_t)(dr / nwarps) << " send=" << (uint64_t)(se / nwarps)
               << " barrier=" << (uint64_t)((to - dr - se) / nwarps) << " total=" << (uint64_t)(to / nwarps) << " max_total=" << tmax
               << " max_drain=" << mdr << " max_send=" << mse << " rounds=" << rmax << "\n";
+#if PROBE_APPLYT
+    { double h = 0, s = 0; for (auto& x : ph) { h += x.pa_h; s += x.pa_s; }
+      std::cout << "probe apply (mean per warp): handler=" << (uint64_t)(h / nwarps) << " hsend=" << (uint64_t)(s / nwarps)
+                << " recv=" << (uint64_t)(dr / nwarps) << " send=" << (uint64_t)(se / nwarps) << " total=" << (uint64_t)(to / nwarps) << "\n"; }
+#endif
+#if ROUND1
+    std::cout << "probe round1 send=" << (uint64_t)(se / nwarps) << "\n";
+#endif
     const bool ok = bad == 0 && maxrel < 1e-9 && rmin == rmax && (!ACTOR || (rmax == rdr && recvd == rdm));
     std::cout << "validation: " << bad << " wrong weights of " << n << ", max relative error vs exact " << maxrel
               << ", rounds " << rmax << " (warps agree " << (rmin == rmax) << ")";

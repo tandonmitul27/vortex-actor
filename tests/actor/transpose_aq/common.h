@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // Sparse matrix transpose, after HClib-Actor's bale_actor tests (srirajpaul/hclib, branch bale3_actor):
 // test/transpose_selector.cpp (the actor version) and test/transpose_agi.cpp (the non-actor baseline).
 // Input: the tests' matrix, bale's erdos_renyi_random_graph(n, p, DIRECTED, NOLOOPS) with n = TR_LROWS * N rows
@@ -20,6 +23,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 #include <stdint.h>
+#include "../probe_apply.h"   // PROBE_APPLYT (measurement only)
 #ifndef NASSUME
 #define NASSUME    256      // actors
 #endif
@@ -64,12 +68,25 @@
 #ifndef LANE_RECV
 #define LANE_RECV  0        // 1: piece C off: a lane drains a whole queue by itself (lane ln takes the warp's queues
 #endif                      //    ln, ln + 16, ...); with tiles each lane has its own TILE_W / 16-word tile
-static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 4 <= 16384), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
+static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 4 <= (LMEM_BYTES)), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
 #define KW         ((NOTILE || !LANE_RECV) ? (TILE_W) : (TILE_W) / (GLANES))   // columns per queue key (tile)
 constexpr uint32_t tr_log2(uint32_t x) { return x <= 1 ? 0 : 1 + tr_log2(x / 2); }
 #define TB         (tr_log2(KW))       // bits of the in-tile column
 
-typedef struct { uint64_t p1, scan, p2, total, msgs, t0, t1, pad; } phase_cycles_t;
+#ifndef PROBE_NOAPPLY
+#define PROBE_NOAPPLY 0     // 1: measurement only, the receive reads every message and skips the apply (B off only;
+#endif                      //    results are not checked, message counts are)
+#ifndef PROBE_TIMERS
+#define PROBE_TIMERS 0      // 1: measurement only, time the send and receive calls of both rounds
+#endif
+typedef struct { uint64_t p1, scan, p2, total, msgs, t0, t1, pad;
+#if PROBE_TIMERS
+                 uint64_t snd, rcv;
+#endif
+#if PROBE_APPLYT
+                 uint64_t pa_slot[2], pa_h, pa_s;   // handler timers (with PROBE_TIMERS: receive = rcv)
+#endif
+} phase_cycles_t;
 
 typedef struct {
     uint64_t aoff_addr;       // int[P][lrows + 1]: PE p's row offsets of A (absolute, into anz)

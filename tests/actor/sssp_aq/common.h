@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // SSSP, Bellman-Ford, after bale (jdevinney/bale, src/bale_classic/apps/sssp_src): sssp_bellman_conveyor.upc
 // (the message-passing version) and its README (the AGP version needs an atomic min of a double). Input: bale's sssp
 // default, a directed weighted Erdos-Renyi graph without loops: n = SS_LROWS * N vertices, every off-diagonal (v, w)
@@ -20,6 +23,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 #include <stdint.h>
+#include "../probe_apply.h"   // PROBE_APPLYT, ROUND1 (measurement only)
 #ifndef NASSUME
 #define NASSUME    256      // actors
 #endif
@@ -49,7 +53,7 @@
 #ifndef LANE_RECV
 #define LANE_RECV  0        // 1: piece C off: a lane drains a whole queue by itself; with tiles each lane has its own
 #endif                      //    TILE_W / 16-weight tile
-static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 8 <= 16384), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
+static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 8 <= (LMEM_BYTES)), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
 #define KW         ((NOTILE || !LANE_RECV) ? (TILE_W) : (TILE_W) / (GLANES))   // vertices per queue key (tile)
 constexpr uint32_t ss_log2(uint32_t x) { return x <= 1 ? 0 : 1 + ss_log2(x / 2); }
 #define TB         (ss_log2(KW))       // bits of the in-tile index
@@ -85,7 +89,11 @@ static_assert(!(NOTILE) || NT == 1, "NOTILE needs TILE_W >= SS_L");
 #define SEND_LANE  0        // senders: 1 a lane per vertex (its out-edges in a loop), 0 a warp per vertex (lanes over them)
 #endif
 
-typedef struct { uint64_t drain, send, total, msgs, rounds, t0, t1, pad; } phase_cycles_t;
+typedef struct { uint64_t drain, send, total, msgs, rounds, t0, t1, pad;
+#if PROBE_APPLYT
+                 uint64_t pa_slot[2], pa_h, pa_s;   // drain = the receive calls, send = the sends (no handler sends)
+#endif
+} phase_cycles_t;
 
 typedef struct {
     uint64_t off_addr;        // ACTOR=1: uint32_t[P][VL + 1] PE p's out-edge offsets (absolute); ACTOR=0: uint32_t[n + 1]

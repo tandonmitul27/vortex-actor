@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // PageRank (pull), after HClib-Actor's bale_actor tests (srirajpaul/hclib, branch bale3_actor):
 // test/pagerank_pull_LU_selector.cpp (the actor version) and test/pagerank_pull_LU_agi.cpp (the non-actor baseline).
 // Input and iteration as pr_aq (the push tests'): A2 = L + U of erdos_renyi_random_graph(n, p, UNDIRECTED, NOLOOPS),
@@ -53,7 +56,7 @@
 #ifndef LANE_RECV
 #define LANE_RECV  0        // 1: piece C off: a lane serves / drains a whole queue by itself; with tiles each lane
 #endif                      //    has its own TILE_W / 16-double RESPONSE tile
-static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 8 <= 16384), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
+static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 8 <= (LMEM_BYTES)), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
 #define KW         ((NOTILE || !LANE_RECV) ? (TILE_W) : (TILE_W) / (GLANES))   // rows per RESPONSE queue key (tile)
 static_assert(((RQ_W) & ((RQ_W) - 1)) == 0, "RQ_W: a power of 2");
 static_assert(((NASSUME) & ((NASSUME) - 1)) == 0, "NASSUME: a power of 2");

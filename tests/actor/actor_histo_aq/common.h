@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // actor_histo_aq: Bale histogram with message transport on the combining
 // append queue. This is mechanism 1 of docs/aq_mechanisms.md carried across
 // from index gather to a second kernel, to test whether it is a general actor
@@ -332,7 +335,7 @@ static_assert(!(APPLY) || !(TILE_ACC), "APPLY and TILE_ACC both accumulate: pick
 #else
 #define BUF_WORDS  ((ACC_LS) * (GLANES) * (SPLIT) * ((WC_RECV) ? 2 : 1) * (RECV_IL))   /* one row per lane (+ a private row each under WC_RECV) */
 #endif
-static_assert(BUF_WORDS * 4 <= 16384,
+static_assert(BUF_WORDS * 4 <= (LMEM_BYTES),
               "accumulator exceeds the 16 KB PHYSICAL scratchpad: raise BUCKET_TILE "
               "(LMEMW is only the assert's bound, the hardware masks and wraps)");
 static_assert((CHUNKS) >= 1 && (M) % (CHUNKS) == 0, "CHUNKS must divide M");

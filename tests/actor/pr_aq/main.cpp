@@ -11,6 +11,9 @@
 #include <algorithm>
 #include <vortex.h>
 #include "common.h"
+#ifndef PROBE_NOAPPLY
+#define PROBE_NOAPPLY 0   // 1: measurement only, the receive skips the apply (results are not checked, counts are)
+#endif
 #include "../isa2.h"
 
 int main() {
@@ -153,7 +156,7 @@ int main() {
         sum += g;
         maxrel = std::max(maxrel, std::fabs(g - rpr[r]) / rpr[r]);
     }
-    const bool ok = itmin == itmax && itmax == rit && maxrel < 1e-9 && std::fabs(sum - 1.0) < 0.001
+    const bool ok = itmin == itmax && itmax == rit && ((maxrel < 1e-9 && std::fabs(sum - 1.0) < 0.001) || PROBE_NOAPPLY)
                     && (!ACTOR || recvd == (uint64_t)rit * nnz);
     std::cout << "validation: iterations " << itmax << " (warps agree " << (itmin == itmax) << ") of " << rit
               << ", max relative rank error " << maxrel << ", rank sum " << sum;

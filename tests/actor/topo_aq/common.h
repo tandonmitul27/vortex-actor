@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // Toposort, after HClib-Actor's bale_actor tests (srirajpaul/hclib, branch bale3_actor):
 // test/toposort_selector.cpp (the actor version) and test/toposort_agi.cpp (the non-actor baseline).
 // Input: the tests' matrix, generate_toposort_input: T = transpose(erdos_renyi_random_graph(n, p, UNDIRECTED, LOOPS,
@@ -24,6 +27,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 #include <stdint.h>
+#include "../probe_apply.h"   // PROBE_APPLYT, ROUND1 (measurement only)
 #ifndef NASSUME
 #define NASSUME    256      // actors
 #endif
@@ -73,13 +77,13 @@ typedef uint32_t msg_t;
 #ifndef LANE_RECV
 #define LANE_RECV  0        // 1: piece C off: a lane drains a whole queue by itself; with tiles each lane has its own
 #endif                      //    TILE_W / 16-word CPERM tile (and DEC queues are keyed by the same smaller tile)
-static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 4 <= 16384), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
+static_assert((TILE_W & (TILE_W - 1)) == 0 && (NOTILE || (TILE_W) * (SPLIT) * 4 <= (LMEM_BYTES)), "TILE_W: a power of 2, SPLIT tiles in 16 KB");
 #define KW         ((NOTILE || !LANE_RECV) ? (TILE_W) : (TILE_W) / (GLANES))   // rows per queue key (tile)
 #ifndef NUM_CORES
 #define NUM_CORES  16
 #endif
 #define TP_GPC     ((((NASSUME) / (GLANES)) + (NUM_CORES) - 1) / (NUM_CORES))   // groups per core (D off: 4); each has its own slice
-#define SPW        ((NOTILE) ? 16384 / ((SPLIT) * 4 * (TP_GPC)) : (TILE_W))     // scratchpad words per warp
+#define SPW        ((NOTILE) ? (LMEM_BYTES) / ((SPLIT) * 4 * (TP_GPC)) : (TILE_W))     // scratchpad words per warp
 constexpr uint32_t tp_log2(uint32_t x) { return x <= 1 ? 0 : 1 + tp_log2(x / 2); }
 #define TB         (tp_log2(KW))       // bits of the in-tile index
 #define LNB        (tp_log2(NASSUME))
@@ -105,7 +109,11 @@ static_assert(!(NOTILE) || NT == 1, "NOTILE needs TILE_W >= TP_L");
 #ifndef PROF
 #define PROF       0        // 1: phase 1 cycles split into MATCH rounds, DEC rounds, barriers (diagnostic)
 #endif
-typedef struct { uint64_t p1, p2, total, msgs, rounds, levels, t0, t1, prof[8]; } phase_cycles_t;
+typedef struct { uint64_t p1, p2, total, msgs, rounds, levels, t0, t1, prof[8];
+#if PROBE_APPLYT || ROUND1
+                 uint64_t pa_slot[2], pa_h, pa_s, pa_r, pa_x, r1;   // handlers, their sends, receive calls, other sends
+#endif
+} phase_cycles_t;
 
 typedef struct {
     uint64_t toff_addr;       // uint32_t[P][lrows + 1]: PE p's column offsets of tmat (absolute, into tnz)

@@ -15,6 +15,39 @@
 #include "processor_impl.h"
 #include "emulator.h"
 #include "core.h"
+#include <unordered_map>
+#include <cstdio>
+
+// diagnostic (2026-11-16, Fig. 2b apply lines): VORTEX_MEM_PAGEHIST=<file> counts DRAM reads/writes per 4 KB page
+// over the same window as perf_mem_reads_/perf_mem_writes_ (cleared by reset) and writes "page reads writes" lines
+// to <file> when the processor is destroyed. Unset = nothing is counted.
+static const char* g_page_hist_file = getenv("VORTEX_MEM_PAGEHIST");
+static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> g_page_hist;
+
+// diagnostic (2026-11-16, Fig. 2b floor): VORTEX_EPOCH_RANGES=lo-hi[,lo-hi...] (hex byte ranges) counts, between global
+// barrier releases, the distinct 64 B lines of those ranges that cores read and those they write (an atomic does both),
+// summed over epochs: the lines that cross DRAM if each line touched in a round crosses once per round. Printed at exit.
+#include <unordered_set>
+#include <vector>
+static std::vector<std::pair<uint64_t, uint64_t>> epoch_ranges() {
+  std::vector<std::pair<uint64_t, uint64_t>> v; const char* e = getenv("VORTEX_EPOCH_RANGES");
+  while (e && *e) { char* x; uint64_t lo = strtoull(e, &x, 16); uint64_t hi = strtoull(x + 1, &x, 16); v.push_back({lo, hi}); e = *x ? x + 1 : x; }
+  return v;
+}
+static const std::vector<std::pair<uint64_t, uint64_t>> g_ep_ranges = epoch_ranges();
+static std::unordered_set<uint64_t> g_ep_rd, g_ep_wr;
+static uint64_t g_ep_n = 0, g_ep_rsum = 0, g_ep_wsum = 0;
+void epoch_touch(uint64_t addr, uint32_t bytes, bool rd, bool wr) {
+  if (g_ep_ranges.empty()) return;
+  for (auto& r : g_ep_ranges) if (addr >= r.first && addr < r.second) {
+    for (uint64_t l = addr >> 6; l <= (addr + bytes - 1) >> 6; ++l) { if (rd) g_ep_rd.insert(l); if (wr) g_ep_wr.insert(l); }
+    return;
+  }
+}
+void epoch_barrier() {
+  if (g_ep_ranges.empty()) return;
+  g_ep_rsum += g_ep_rd.size(); g_ep_wsum += g_ep_wr.size(); ++g_ep_n; g_ep_rd.clear(); g_ep_wr.clear();
+}
 
 using namespace vortex;
 
@@ -76,6 +109,7 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
     memsim_->MemReqPorts.at(i).tx_callback([&](const MemReq& req, uint64_t cycle){
       perf_mem_reads_  += !req.write;
       perf_mem_writes_ += req.write;
+      if (g_page_hist_file) { auto& e = g_page_hist[req.addr >> 12]; (req.write ? e.second : e.first) += 1; }
       // diagnostic: VORTEX_MEM_SAMPLE=<cycles> prints cumulative DRAM reads/writes over time
       static const uint64_t mem_sample = getenv("VORTEX_MEM_SAMPLE") ? strtoull(getenv("VORTEX_MEM_SAMPLE"), nullptr, 0) : 0;
       static uint64_t mem_next = 0;
@@ -108,6 +142,16 @@ ProcessorImpl::ProcessorImpl(const Arch& arch)
 }
 
 ProcessorImpl::~ProcessorImpl() {
+  if (!g_ep_ranges.empty()) {
+    epoch_barrier();   // the last epoch (after the final barrier)
+    fprintf(stderr, "EPOCH epochs=%lu read_lines=%lu write_lines=%lu\n", (unsigned long)g_ep_n, (unsigned long)g_ep_rsum, (unsigned long)g_ep_wsum);
+  }
+  if (g_page_hist_file) {
+    if (FILE* f = fopen(g_page_hist_file, "w")) {
+      for (auto& kv : g_page_hist) fprintf(f, "%lx %lu %lu\n", (unsigned long)kv.first, (unsigned long)kv.second.first, (unsigned long)kv.second.second);
+      fclose(f);
+    }
+  }
   SimPlatform::instance().finalize();
 }
 
@@ -147,6 +191,8 @@ int ProcessorImpl::run() {
 }
 
 void ProcessorImpl::reset() {
+  g_page_hist.clear();
+  g_ep_rd.clear(); g_ep_wr.clear(); g_ep_n = g_ep_rsum = g_ep_wsum = 0;
   perf_mem_reads_ = 0;
   perf_mem_writes_ = 0;
   perf_mem_latency_ = 0;

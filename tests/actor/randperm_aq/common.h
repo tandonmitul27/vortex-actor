@@ -1,3 +1,6 @@
+#ifndef LMEM_BYTES
+#define LMEM_BYTES 16384   // scratchpad bytes per core (sensitivity runs pass -DLMEM_BYTES; 2026-11-15)
+#endif
 // Random permutation (dart throwing), after HClib-Actor's bale_actor tests (srirajpaul/hclib, branch bale3_actor):
 // test/randperm_selector.cpp (the actor version) and test/randperm_agi.cpp (the non-actor baseline).
 // n = RP_LROWS * N items (-n), M = 2n target slots, distributed cyclically: slot r belongs to PE r % P at r / P.
@@ -19,6 +22,7 @@
 #ifndef COMMON_H
 #define COMMON_H
 #include <stdint.h>
+#include "../probe_apply.h"   // PROBE_APPLYT, ROUND1 (measurement only)
 #ifndef NASSUME
 #define NASSUME    256      // actors
 #endif
@@ -57,7 +61,9 @@
 #endif
 #define LANES      16
 #define GLANES     16
-#define NBLK       16                           // blocks = cores (one block of SPLIT warps per core)
+#ifndef NBLK
+#define NBLK       16                           // blocks = cores (one block of SPLIT warps per core); sensitivity runs set the core count
+#endif
 #define APB        ((NASSUME) / (NBLK))         // actors per block
 #define OW         ((APB) / (SPLIT))            // actors per warp
 static_assert((OW) >= 1 && (APB) % (SPLIT) == 0, "NASSUME: a multiple of NBLK * SPLIT");
@@ -127,7 +133,7 @@ static_assert((TILE0) || (TILEK) <= 1, "TILEK needs TILE0");
 static_assert(!(NOTILE) || ((TS) == 1 && !(TILE0)), "NOTILE needs TILE0=0 and a slot field that holds the actor's slots");
 #define SPW        ((LANE_RECV) ? (TILE_W) * (GLANES) : (TILE_W))   // scratchpad words per warp (TILE0)
 static_assert(!(PIPE) || (CLAIM), "PIPE needs CLAIM=1");
-static_assert(!(TILE0) || (TILE_W) * (SPLIT) * 4 <= 16384, "TILE0: the tiles do not fit the 16 KB scratchpad");
+static_assert(!(TILE0) || (TILE_W) * (SPLIT) * 4 <= (LMEM_BYTES), "TILE0: the tiles do not fit the 16 KB scratchpad");
 
 // slot of an item's k-th throw: murmur3's finalizer of (item, k, seed), scaled to [0, M)
 static inline uint32_t rp_slot(uint32_t item, uint32_t k, uint32_t seed, uint32_t M) {
@@ -139,7 +145,11 @@ static inline uint32_t rp_slot(uint32_t item, uint32_t k, uint32_t seed, uint32_
 #ifndef PROF
 #define PROF       0        // 1: phase 1 step timers (round-0 throws, serve round 0, serve later, reply, barriers)
 #endif
-typedef struct { uint64_t p1, p2, total, msgs, throws, rounds, t0, t1, prof[5]; } phase_cycles_t;
+typedef struct { uint64_t p1, p2, total, msgs, throws, rounds, t0, t1, prof[5];
+#if PROBE_APPLYT || ROUND1
+                 uint64_t pa_slot[2], pa_h, pa_s, pa_r, pa_x, r1;   // handlers, their sends, receive calls, other sends
+#endif
+} phase_cycles_t;
 
 typedef struct {
     uint64_t tgt_addr;        // ACTOR=1: uint32_t[N][lM] target slots, EMPTY; ACTOR=0: uint32_t[M]
