@@ -15,6 +15,7 @@
 
 #include "types.h"
 #include "memory.h"
+#include "fgc_stats.h"
 
 namespace vortex {
 
@@ -67,6 +68,7 @@ public:
 		uint64_t bank_stalls = 0;
 		uint64_t mshr_stalls = 0;
 		uint64_t mem_latency = 0;
+		fgc::MemStats fgc;
 
 		PerfStats& operator+=(const PerfStats& rhs) {
 			this->reads += rhs.reads;
@@ -77,6 +79,7 @@ public:
 			this->bank_stalls += rhs.bank_stalls;
 			this->mshr_stalls += rhs.mshr_stalls;
 			this->mem_latency += rhs.mem_latency;
+			this->fgc += rhs.fgc;
 			return *this;
 		}
 	};

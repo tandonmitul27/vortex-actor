@@ -1,0 +1,24 @@
+{
+  "name": "base_1c",
+  "description": "Stock configurable Vortex machine, 1 cores x 4 warps x 4 threads, shared L2, atomics (A + Zacas). Base-machine functional check.",
+  "core": {
+    "VX_CFG_NUM_WARPS": 4,
+    "VX_CFG_NUM_THREADS": 4,
+    "VX_CFG_EXT_A_ENABLE": true,
+    "VX_CFG_EXT_ZACAS_ENABLE": true,
+    "VX_CFG_ICALL_SPLIT_ENABLE": true
+  },
+  "chip": {
+    "VX_CFG_NUM_CORES": 1,
+    "VX_CFG_L2_ENABLE": true,
+    "VX_DBG_STALL_TIMEOUT": 10000000
+  },
+  "sources": {
+    "NUM_CORES": "shape under test",
+    "L2_ENABLE": "atomics from several cores must meet at a shared level",
+    "EXT_A_ENABLE": "atomics are needed by any cross-thread program",
+    "EXT_ZACAS_ENABLE": "without it CAS is an lr/sc loop that hangs divergent warps",
+    "ICALL_SPLIT_ENABLE": "SimX only: a call whose target differs across lanes runs one target at a time and rejoins at the return; the compiler emits it as one jalr (wrong results, simt_div modes 0, 9). Kernels build with -fno-optimize-sibling-calls",
+    "DBG_STALL_TIMEOUT": "10M cycles (stock 200k with L2): many warps queued on atomics to one word wait longer than 200k cycles without any hang"
+  }
+}

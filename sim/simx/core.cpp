@@ -115,6 +115,12 @@ public:
     , staged_since_(VX_CFG_NUM_WARPS, 0)
     , head_staged_(VX_CFG_NUM_WARPS, false)
   {
+    fgc_on_ = (fgc::out_path() != nullptr);
+    fgc_state_.resize(VX_CFG_NUM_WARPS, fgc::ST_NONE);
+    fgc_pc_.resize(VX_CFG_NUM_WARPS, 0);
+    fgc_last_pc_.resize(VX_CFG_NUM_WARPS, 0);
+    fgc_fetching_.resize(VX_CFG_NUM_WARPS, false);
+    fgc_held_.resize(VX_CFG_NUM_WARPS, false);
     const std::string& name = simobject_->name();
     char sname[100];
 
@@ -534,6 +540,9 @@ public:
     // profiling
     perf_stats_.active_warps += scheduler_->active_warps().count();
     perf_stats_.stalled_warps += scheduler_->stalled_warps().count();
+    if (fgc_on_) {
+      this->fgc_charge();
+    }
 
     scheduler_->schedule_begin();
 
@@ -569,6 +578,9 @@ public:
 
       fetch_latch->push(trace);
       DT(3, simobject_->name() << "-pipeline schedule: " << *trace);
+      fgc_last_pc_.at(trace->wid) = trace->PC;
+      fgc_fetching_.at(trace->wid) = true;
+      fgc_held_.at(trace->wid) = false;
       this->pending_add(trace->wid);
       ++ibuf_inflight_.at(trace->wid);
       perf_stats_.issued_warps += 1;
@@ -767,6 +779,9 @@ public:
       scheduler_->advance_pc(trace, is_rvc ? 2 : 4);
     }
 
+    fgc_fetching_.at(trace->wid) = false;
+    fgc_held_.at(trace->wid) = trace->fetch_stall;
+
     // Resume warp for non-stalling instructions (ALU, FPU);
     // stalling instructions (LSU, SFU, TCU, branches) stay suspended until commit
     if (!trace->fetch_stall) {
@@ -793,6 +808,9 @@ public:
       if (dispatchers_.at((int)trace->fu_type)->Inputs.at(iw).try_send(trace, 2)) {
         operand->Output.pop();
       } else {
+        if (fgc_on_) {
+          ++fgc_pcs_[trace->PC].disp;
+        }
         switch (trace->fu_type) {
         case FUType::ALU: ++perf_stats_.alu_stalls; break;
         case FUType::FPU: ++perf_stats_.fpu_stalls; break;
@@ -863,6 +881,8 @@ public:
           // Count once per cycle per issue slice regardless of how many
           // warps are blocked.
           any_scrb_blocked = true;
+          fgc_state_.at(wid) = fgc::ST_SCRB;
+          fgc_pc_.at(wid) = uop_trace->PC;
         } else {
           uop_trace->log_once(false);
           if (seq_starting) {
@@ -916,6 +936,12 @@ public:
         // to operand stage
         if (operands_.at(iw)->Input.try_send(uop_trace)) {
           ibuffer_arbs_.at(iw).commit(w);
+          uop_trace->issue_time = SimPlatform::instance().cycles();
+          if (fgc_on_) {
+            fgc_state_.at(wid) = fgc::ST_ISSUE;
+            fgc_pc_.at(wid) = uop_trace->PC;
+            fgc_pcs_[uop_trace->PC].lanes += uop_trace->tmask.count();
+          }
           // capture register operands at issue (Operands owns regfile)
           operands_.at(iw)->fetch_operands(uop_trace);
           // A macro leaves the pending count once its last micro-op issues, so
@@ -1236,6 +1262,11 @@ public:
       }
       // track committed instructions
       perf_stats_.instrs += 1;
+      if (fgc_on_) {
+        auto& ps = fgc_pcs_[trace->PC];
+        ++ps.commits;
+        ps.latency += SimPlatform::instance().cycles() - trace->issue_time;
+      }
 
       // instruction completed
       this->pending_remove(trace->wid);
@@ -1311,6 +1342,35 @@ public:
       perf_stats_.opds_stalls += operands_.at(iw)->total_stalls();
     }
     return perf_stats_;
+  }
+
+  const fgc::PcMap& fgc_pcs() const {
+    return fgc_pcs_;
+  }
+
+  // Charges this cycle of every active warp to one PC and state
+  // (see fgc_stats.h).
+  void fgc_charge() {
+    for (uint32_t w = 0; w < VX_CFG_NUM_WARPS; ++w) {
+      auto state = fgc_state_.at(w);
+      fgc_state_.at(w) = fgc::ST_NONE;
+      if (!scheduler_->active_warps().test(w)) {
+        continue;
+      }
+      if (state == fgc::ST_ISSUE) {
+        ++fgc_pcs_[fgc_pc_.at(w)].issue;
+      } else if (state == fgc::ST_SCRB) {
+        ++fgc_pcs_[fgc_pc_.at(w)].scrb;
+      } else if (!ibuffers_.at(w)->empty()) {
+        ++fgc_pcs_[ibuffers_.at(w)->peek()->PC].head;
+      } else if (fgc_fetching_.at(w)) {
+        ++fgc_pcs_[fgc_last_pc_.at(w)].fetch;
+      } else if (fgc_held_.at(w) && scheduler_->stalled_warps().test(w)) {
+        ++fgc_pcs_[fgc_last_pc_.at(w)].wait;
+      } else {
+        ++fgc_pcs_[scheduler_->warp(w).PC].idle;
+      }
+    }
   }
 
   int get_exitcode() const {
@@ -1436,6 +1496,14 @@ private:
   uint64_t pending_ifetches_;
 
   mutable PerfStats perf_stats_;
+
+  bool                      fgc_on_;
+  fgc::PcMap                fgc_pcs_;
+  std::vector<fgc::State>   fgc_state_;   // [wid] what the warp did at issue this cycle
+  std::vector<Word>         fgc_pc_;      // [wid] the PC of that state
+  std::vector<Word>         fgc_last_pc_; // [wid] the PC fetched last
+  std::vector<bool>         fgc_fetching_; // [wid] that PC is between fetch and decode
+  std::vector<bool>         fgc_held_;    // [wid] that PC holds fetch until it resolves
 
   // [iw][fu] commit staging: FU outputs land here one registered stage
   // before retirement; commit() grants among them fixed-priority.
@@ -1624,6 +1692,10 @@ Core::PerfStats& Core::perf_stats() {
 
 const Core::PerfStats& Core::perf_stats() const {
   return impl_->perf_stats();
+}
+
+const fgc::PcMap& Core::fgc_pcs() const {
+  return impl_->fgc_pcs();
 }
 
 int Core::get_exitcode() const {

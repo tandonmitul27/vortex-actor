@@ -446,6 +446,7 @@ struct bank_req_t {
   uint64_t req_tag;
   std::shared_ptr<const std::vector<uint32_t>> merged_tags; // ride to the response
   uint64_t uuid;
+  uint64_t pc;        // the load/store's PC, for the fgc counters
   uint32_t mshr_id;
   ReqType type;
   bool write;
@@ -498,6 +499,7 @@ struct bank_req_t {
     req_tag = 0;
     merged_tags.reset();
     uuid = 0;
+    pc = 0;
     mshr_id = 0;
     type = ReqType::None;
     write = false;
@@ -872,6 +874,7 @@ protected:
   void on_reset() {
     // perf_stats_ survives: the MPM counters run from device reset.
     pending_mshr_size_ = 0;
+    pipe_replays_ = 0;
     mshr_occupancy_ = 0;
     pending_amo_probes_ = 0;
     pipe_core_lines_.clear();
@@ -926,7 +929,9 @@ protected:
 
     // MSHR occupancy is a registered count: slots a forward, replay or
     // release frees this tick admit a new request only from the next one.
-    mshr_occupancy_ = mshr_.size() + pending_mshr_size_;
+    // A replay keeps its slot reserved until it leaves the pipe: one whose
+    // sector was evicted meanwhile re-enqueues as a fresh miss.
+    mshr_occupancy_ = mshr_.size() + pending_mshr_size_ + pipe_replays_;
 
     // Process next request at the head of the pipeline. A head that cannot
     // retire stalls the whole pipeline, its input stage included: a bubble
@@ -1026,6 +1031,7 @@ private:
       bank_req_t bank_req;
       mshr_.dequeue(&bank_req);
       pipe_req_->push(bank_req);
+      ++pipe_replays_;
       DT(3, this->name() << " replay-deq: " << bank_req);
       return;
     }
@@ -1272,6 +1278,7 @@ private:
             coalesced.addr    = core_req.addr;
             coalesced.hart_id = core_req.hart_id;
             coalesced.uuid    = core_req.uuid;
+            coalesced.pc      = core_req.pc;
             coalesced.req_tag = core_req.tag;
             coalesced.merged_tags = core_req.merged_tags;
             coalesced.write   = (core_req.op == MemOp::ST);
@@ -1291,6 +1298,7 @@ private:
             DT(3, this->name() << " mshr-coalesce@admission: " << coalesced);
             // Chain joiners count as misses, matching the pipe-exit chaining
             // they replace.
+            this->fgc_count(fgc::IN, core_req);
             if (core_req.is_write()) {
               ++perf_stats_.writes;
               ++perf_stats_.write_misses;
@@ -1311,6 +1319,7 @@ private:
       bank_req.addr    = core_req.addr;
       bank_req.hart_id = core_req.hart_id;
       bank_req.uuid    = core_req.uuid;
+      bank_req.pc      = core_req.pc;
       bank_req.req_tag = core_req.tag;
       bank_req.merged_tags = core_req.merged_tags;
       // bank_req.write means "route through the cache write path" — true only
@@ -1340,6 +1349,7 @@ private:
         amo_busy_ = true;
       }
 #endif
+      this->fgc_count(fgc::IN, core_req);
       if (core_req.is_write()) ++perf_stats_.writes;
       else                ++perf_stats_.reads;
       this->core_req_in.pop();
@@ -1602,6 +1612,7 @@ private:
         w.op = MemOp::ST;
         w.hart_id    = bank_req.hart_id;
         w.uuid   = bank_req.uuid;
+        w.pc = bank_req.pc;
         w.data   = store_block;
         w.byteen = byteen;
         this->send_mem_req(w);
@@ -1636,7 +1647,14 @@ private:
   // Debug: a write-through cache holds each write at the head of bank 0's
   // queue for a fixed delay, the requests behind it included, so requests
   // through the other banks overtake it unless something orders them.
+  void fgc_count(fgc::Side side, const MemReq& req) {
+    if (fgc::out_path() && !req.flags.flush) {
+      perf_stats_.fgc.count(side, req.addr, req.pc, memop_is_atomic(req.op), req.op == MemOp::ST, req.byteen);
+    }
+  }
+
   void send_mem_req(const MemReq& req) {
+    this->fgc_count(fgc::OUT, req);
   #ifdef DBG_MEM_BANK0_WDELAY
     if (bank_id_ == 0 && !config_.write_back) {
       constexpr uint64_t DBG_WDELAY = 2048;
@@ -1655,7 +1673,7 @@ private:
   // All backpressure is checked before any send, so a false return stalls
   // the caller with no partial effects.
   bool emitWritethrough(uint32_t set_id, uint64_t addr_tag, uint32_t sector_id,
-                        uint64_t full_addr, uint32_t hart_id, uint64_t uuid,
+                        uint64_t full_addr, uint32_t hart_id, uint64_t uuid, uint64_t pc,
                         const std::shared_ptr<mem_block_t>& data, uint64_t byteen,
                         bool need_rsp, uint64_t rsp_tag) {
     __unused(full_addr);
@@ -1670,6 +1688,7 @@ private:
     w.op      = MemOp::ST;
     w.hart_id = hart_id;
     w.uuid    = uuid;
+    w.pc      = pc;
     w.data    = data;
     w.byteen  = byteen;
     this->send_mem_req(w);
@@ -1773,6 +1792,7 @@ private:
       amo_fwd.tag    = amo_passthru_tag_base() + pid;
       amo_fwd.hart_id = bank_req.hart_id;
       amo_fwd.uuid    = bank_req.uuid;
+      amo_fwd.pc = bank_req.pc;
       amo_fwd.op      = bank_req.op;
       amo_fwd.byteen  = bank_req.byteen;  // carries width info (popcount-derived at LLC)
       amo_fwd.amo_cmp = bank_req.amo_cmp;
@@ -1818,6 +1838,7 @@ private:
       fill.tag     = bank_req.mshr_id;
       fill.hart_id = bank_req.hart_id;
       fill.uuid    = bank_req.uuid;
+      fill.pc = bank_req.pc;
       this->send_mem_req(fill);
       DT(3, this->name() << " refetch-req: " << fill);
       ++pending_fill_reqs_;
@@ -1846,6 +1867,7 @@ private:
         // A write-through merge already propagated its store downstream at
         // miss time, so a vanished line needs no replay — drop it.
         if (bank_req.write && bank_req.skip_core_rsp) {
+          --pipe_replays_;
           pipe_req_->pop();
           return;
         }
@@ -1870,9 +1892,11 @@ private:
           fill.tag     = mshr_id;
           fill.hart_id = bank_req.hart_id;
           fill.uuid    = bank_req.uuid;
+          fill.pc = bank_req.pc;
           this->send_mem_req(fill);
           ++pending_fill_reqs_;
         }
+        --pipe_replays_;
         pipe_req_->pop();
         return;
       }
@@ -1884,6 +1908,7 @@ private:
           return; // stall
         if (config_.repl_policy == Cache::PLRU)
           set.update_lru(hit_id);
+        --pipe_replays_;
         pipe_req_->pop();
         return;
       }
@@ -1927,6 +1952,7 @@ private:
       if (config_.repl_policy == Cache::PLRU)
         set.update_lru(hit_id);
 
+      --pipe_replays_;
       pipe_req_->pop();
     } break;
 
@@ -1962,7 +1988,7 @@ private:
           || bank_req.write || memop_is_atomic(bank_req.op))) {
           if (bank_req.write && !config_.write_back) {
             if (!this->emitWritethrough(set_id, addr_tag, sector_id,
-                                        bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                        bank_req.addr, bank_req.hart_id, bank_req.uuid, bank_req.pc,
                                         bank_req.data, bank_req.byteen,
                                         need_core_rsp(bank_req), bank_req.req_tag)) {
               return;
@@ -2022,6 +2048,7 @@ private:
             w.op = MemOp::ST;
             w.hart_id    = bank_req.hart_id;
             w.uuid   = bank_req.uuid;
+            w.pc = bank_req.pc;
             w.data   = bank_req.data;
             w.byteen = bank_req.byteen;
             this->send_mem_req(w);
@@ -2058,7 +2085,7 @@ private:
           // A no-allocate write miss with no fill pending on its line goes to
           // memory as is: nothing is allocated or fetched.
           if (!this->emitWritethrough(set_id, addr_tag, sector_id,
-                                      bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                      bank_req.addr, bank_req.hart_id, bank_req.uuid, bank_req.pc,
                                       bank_req.data, bank_req.byteen,
                                       need_core_rsp(bank_req), bank_req.req_tag)) {
             return;
@@ -2076,7 +2103,7 @@ private:
           if (fill_pending && mshr_.full())
             return;
           if (!this->emitWritethrough(set_id, addr_tag, sector_id,
-                                      bank_req.addr, bank_req.hart_id, bank_req.uuid,
+                                      bank_req.addr, bank_req.hart_id, bank_req.uuid, bank_req.pc,
                                       bank_req.data, bank_req.byteen,
                                       need_core_rsp(bank_req), bank_req.req_tag)) {
             return;
@@ -2122,6 +2149,7 @@ private:
             fill.tag   = mshr_id; // routes the fill response back here
             fill.hart_id   = bank_req.hart_id;
             fill.uuid  = bank_req.uuid;
+            fill.pc = bank_req.pc;
             this->send_mem_req(fill);
             DT(3, this->name() << " fill-req: " << fill);
             ++pending_fill_reqs_;
@@ -2257,6 +2285,7 @@ private:
   std::vector<set_t> sets_;
   MSHR mshr_;
   uint32_t pending_mshr_size_;
+  uint32_t pipe_replays_; // replays in the pipe, each holding a table reservation
   uint32_t mshr_occupancy_;
   uint32_t pending_amo_probes_; // AmoProbe requests in the pipe, each holding a table reservation
   // {set, tag} of Core requests inside the pipe: their MSHR entries exist

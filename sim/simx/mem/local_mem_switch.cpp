@@ -57,6 +57,7 @@ void LocalMemSwitch::on_tick() {
     out_dc_req.tag   = in_req.tag;
     out_dc_req.cid   = in_req.cid;
     out_dc_req.uuid  = in_req.uuid;
+    out_dc_req.pc    = in_req.pc;
     out_dc_req.wid   = in_req.wid;
     // Op + per-lane tids carry through. Adapter recovers hart_id via
     // make_hart_id(cid, wid, tids[i]) at the dcache boundary.
@@ -68,6 +69,7 @@ void LocalMemSwitch::on_tick() {
     out_lmem_req.tag   = in_req.tag;
     out_lmem_req.cid   = in_req.cid;
     out_lmem_req.uuid  = in_req.uuid;
+    out_lmem_req.pc    = in_req.pc;
     out_lmem_req.wid   = in_req.wid;
     // Same fields as the dcache branch: the LMEM banks implement AMOs, so
     // amo_unsigned decides the MIN/MAX compare style, and the per-lane tids

@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <iostream>
 #include <stdlib.h>
+#include <cstring>
 #include <dram_sim.h>
 
 #include "mem_block_pool.h"
@@ -26,6 +27,8 @@
 #include "types.h"
 #include "debug.h"
 #include "VX_config.h"
+#include "amo_ops.h"
+#include "amo_unit.h"
 
 using namespace vortex;
 
@@ -44,6 +47,9 @@ private:
 	RAM*      ram_;
 	Memory::PreSendHook pre_send_hook_;
 	mutable PerfStats perf_stats_;
+	// Atomics that reach memory uncached (IO addresses bypass every cache
+	// level) run here, with the LLC's semantics and its own reservations.
+	AmoUnit   amo_unit_;
 	struct DramCallbackArgs {
 		Memory::Impl* memsim;
 		MemReq request;
@@ -57,6 +63,7 @@ public:
 		, config_(config)
 		, dram_sim_(config.dram)
 		, ram_(nullptr)
+		, amo_unit_(__MAX(2u, (uint32_t)VX_CFG_AMO_RS_SIZE))
 	{
 		char sname[100];
 		snprintf(sname, 100, "%s-xbar", simobject->name().c_str());
@@ -92,6 +99,9 @@ public:
 				continue;
 
 			auto& mem_req = mem_xbar_->ReqOut.at(i).peek();
+			if (fgc::out_path()) {
+				perf_stats_.fgc.count(fgc::IN, mem_req.addr, mem_req.pc, memop_is_atomic(mem_req.op), mem_req.is_write(), mem_req.byteen);
+			}
 
 			std::shared_ptr<mem_block_t> rsp_data;
 			if (ram_) {
@@ -102,7 +112,9 @@ public:
 				// since memory buses lack per-region read/write permissions).
 				// Suppress ACL for the duration; ACL still guards upload/download.
 				ram_->enable_acl(false);
-				if (mem_req.is_write()) {
+				if (memop_is_atomic(mem_req.op)) {
+					rsp_data = this->amo_rmw(mem_req, line_addr);
+				} else if (mem_req.is_write()) {
 					// Apply byte-enabled write to RAM at request arrival.
 					// IO_COUT-range bytes are tapped to the print buffer and
 					// not stored in RAM.
@@ -126,16 +138,17 @@ public:
 				pre_send_hook_(mem_req);
 			}
 
-			// enqueue the request to the memory system
+			// enqueue the request to the memory system; an atomic answers like
+			// a read, with its old word
 			auto req_args = new DramCallbackArgs{this, mem_req, i, rsp_data};
 			uint64_t bank_addr = ((mem_req.addr >> lg2_block_size) / num_banks) << lg2_block_size;
 			dram_sim_.send_request(
 				i,
 				bank_addr,
-				mem_req.is_write(),
+				mem_req.is_write() && !memop_is_atomic(mem_req.op),
 				[](void* arg)->bool {
 					auto rsp_args = reinterpret_cast<const DramCallbackArgs*>(arg);
-					if (rsp_args->request.is_write()) {
+					if (rsp_args->request.is_write() && !memop_is_atomic(rsp_args->request.op)) {
 						delete rsp_args;
 						return true;
 					} else {
@@ -155,6 +168,44 @@ public:
 			DT(3, simobject_->name() << " mem-req" << i << ": " << mem_req);
 			mem_xbar_->ReqOut.at(i).pop();
 		}
+	}
+
+	// Read-modify-write one atomic in RAM, as the LLC bank does on a hit: the
+	// word sits at the address's line offset in the request and response
+	// blocks, and its width follows the byte enables (RVA alignment).
+	std::shared_ptr<mem_block_t> amo_rmw(const MemReq& mem_req, uint64_t line_addr) {
+		const uint32_t byte_off = (uint32_t)(mem_req.addr & (VX_CFG_MEM_BLOCK_SIZE - 1));
+		const uint8_t  width    = (__builtin_popcountll(mem_req.byteen) >= 8) ? 3 : 2;
+		const uint32_t wbytes   = 1u << width;
+		const MemOp    op       = mem_req.op;
+		const uint64_t rhs      = mem_req.data
+		                        ? amo_load_word(mem_req.data->data(), byte_off, width)
+		                        : 0ull;
+		const bool sc_fail  = (op == MemOp::AMO_SC) && !amo_unit_.check(mem_req.hart_id, line_addr);
+		const bool do_store = (op != MemOp::AMO_LR) && !sc_fail;
+
+		uint8_t obuf[8] = {0};
+		ram_->read(obuf, line_addr + byte_off, wbytes);
+		auto rmw = amo_unit_.compute(op, width, amo_load_word(obuf, 0, width), rhs,
+		                             mem_req.flags.amo_unsigned, mem_req.amo_cmp);
+
+		auto rsp_block = make_mem_block();
+		std::memset(rsp_block->data(), 0, rsp_block->size());
+		uint64_t rsp_word = (op == MemOp::AMO_SC) ? (sc_fail ? 1ull : 0ull) : rmw.ret_word;
+		amo_store_word(rsp_block->data(), byte_off, width, rsp_word);
+
+		if (op == MemOp::AMO_LR) {
+			amo_unit_.reserve(mem_req.hart_id, line_addr);
+		} else if (op == MemOp::AMO_SC) {
+			amo_unit_.clear(mem_req.hart_id, line_addr);
+		}
+		if (do_store) {
+			uint8_t sbuf[8];
+			amo_store_word(sbuf, 0, width, rmw.new_word);
+			ram_->write(sbuf, line_addr + byte_off, wbytes);
+			amo_unit_.invalidate(line_addr, mem_req.hart_id);
+		}
+		return rsp_block;
 	}
 
 	void attach_ram(RAM* ram) {

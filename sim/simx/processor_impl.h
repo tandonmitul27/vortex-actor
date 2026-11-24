@@ -45,6 +45,9 @@ public:
 
   int run();
 
+  void fgc_dump(const char* path) const;
+  void fgc_load_tags();
+
   // Single-cycle step; see Processor::cycle() doc. Lazily initializes
   // (resets + starts KMU) on the first call after construction or
   // after reset() has been invoked.
@@ -116,6 +119,7 @@ private:
   CpLlcPort::Ptr cp_llc_port_;  // CP DMA client of the last-level cache
   bool platform_reset_ = false;
   uint64_t perf_mem_reads_ = 0;
+  uint64_t fgc_runs_ = 0;
   uint64_t perf_mem_writes_ = 0;
   uint64_t perf_mem_latency_ = 0;
   uint64_t perf_mem_pending_reads_ = 0;

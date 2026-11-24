@@ -31,16 +31,27 @@ class Core;
 class Instr;
 class instr_trace_t;
 
-// IPDOM stack entry — one per nested SPLIT/JOIN.
+// IPDOM stack entry — one per nested SPLIT/JOIN, or per divergent indirect
+// call (ICALL_SPLIT): its lanes run one target at a time and rejoin when the
+// current target's lanes return to link_PC.
 struct ipdom_entry_t {
   ThreadMask  orig_tmask;
   Word        else_PC;
   bool        fallthrough;
+  bool        icall;
+  Word        link_PC;
+  uint32_t    depth;            // calls made by the current target, not yet returned
+  ThreadMask  done;             // lanes whose target has run or is running
+  std::vector<Word> targets;    // per-lane call target
 
   ipdom_entry_t(const ThreadMask &tmask, Word PC)
     : orig_tmask (tmask)
     , else_PC    (PC)
     , fallthrough(false)
+    , icall      (false)
+    , link_PC    (0)
+    , depth      (0)
+    , done       (tmask.size())
   {}
 };
 

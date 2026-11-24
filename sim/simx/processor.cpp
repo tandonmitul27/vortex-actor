@@ -15,12 +15,15 @@
 #include "processor_impl.h"
 #include "core.h"
 #include "scheduler.h"
+#include "socket.h"
+#include <algorithm>
 #include <VX_types.h>
 #ifdef VX_CFG_EXT_RTU_ENABLE
 #include "rtu_raylog.h"
 #endif
 
 #include <cstdlib>
+#include <fstream>
 #include <execinfo.h>
 
 using namespace vortex;
@@ -230,6 +233,11 @@ ProcessorImpl::ProcessorImpl()
 }
 
 ProcessorImpl::~ProcessorImpl() {
+  // Written again at teardown, so the dirty lines the host's readback flushed
+  // are counted.
+  if (fgc::out_path() && fgc_runs_ != 0) {
+    this->fgc_dump(fgc::out_path());
+  }
   SimPlatform::instance().finalize();
 }
 
@@ -309,6 +317,9 @@ void ProcessorImpl::flush_caches(uint32_t fence_op) {
 }
 
 int ProcessorImpl::run() {
+  if (fgc::out_path()) {
+    this->fgc_load_tags();
+  }
   this->launch_reset();
   kmu_->start();
   this->forward_delegated_launch();
@@ -345,7 +356,130 @@ int ProcessorImpl::run() {
     perf_mem_latency_ += perf_mem_pending_reads_;
   } while (!done);
 
+  ++fgc_runs_;
+  if (fgc::out_path()) {
+    this->fgc_dump(fgc::out_path());
+  }
+
   return exitcode;
+}
+
+// Tag 0 is everything untagged, tag 1 the thread stacks, then the ranges in
+// the file VORTEX_FGC_TAGS names ("name base size" per line). Loaded before
+// each launch, while nothing ticks.
+void ProcessorImpl::fgc_load_tags() {
+  constexpr uint64_t num_harts = uint64_t(VX_CFG_NUM_CLUSTERS) * NUM_SOCKETS * VX_CFG_SOCKET_SIZE
+                               * VX_CFG_NUM_WARPS * VX_CFG_NUM_THREADS;
+  constexpr uint64_t stack_size = num_harts << VX_MEM_STACK_LOG2_SIZE;
+  auto& t = fgc::tags();
+  t.clear();
+  t.push_back({"untagged", 0, 0});
+  t.push_back({"stack", uint64_t(VX_MEM_STACK_BASE_ADDR) - stack_size, stack_size});
+  if (const char* path = std::getenv("VORTEX_FGC_TAGS")) {
+    std::ifstream is(path);
+    std::string name;
+    uint64_t base, size;
+    while (is >> name >> std::hex >> base >> size >> std::dec) {
+      t.push_back({name, base, size});
+    }
+  }
+}
+
+static void fgc_dump_mem(std::ostream& os, const char* level, const fgc::MemStats& m) {
+  auto flow = [&](const fgc::Flow& f) {
+    os << "[" << f.rd << ", " << f.wr << ", " << f.wr_bytes << ", " << f.amo << "]";
+  };
+  os << ",\n \"" << level << "\": {\"by_tag\": {";
+  for (size_t t = 0; t < m.by_tag.size(); ++t) {
+    os << (t ? ", " : "") << "\"" << fgc::tags().at(t).name << "\": {\"in\": ";
+    flow(m.by_tag[t][fgc::IN]);
+    os << ", \"out\": ";
+    flow(m.by_tag[t][fgc::OUT]);
+    os << "}";
+  }
+  os << "}, \"by_pc\": {";
+  bool first = true;
+  for (auto& [pc, f] : m.by_pc) {
+    os << (first ? "" : ", ") << "\"0x" << std::hex << pc << std::dec << "\": {\"in\": ";
+    flow(f[fgc::IN]);
+    os << ", \"out\": ";
+    flow(f[fgc::OUT]);
+    os << "}";
+    first = false;
+  }
+  os << "}}";
+}
+
+// Writes the counters of every run so far: the core perf counters and the
+// per-PC rows of each core, then each memory level by tag and by PC.
+void ProcessorImpl::fgc_dump(const char* path) const {
+  std::ofstream os(path);
+  if (!os) {
+    std::cerr << "Error: cannot write " << path << std::endl;
+    return;
+  }
+  constexpr uint32_t cores_per_cluster = NUM_SOCKETS * VX_CFG_SOCKET_SIZE;
+  constexpr uint32_t num_cores = VX_CFG_NUM_CLUSTERS * cores_per_cluster;
+  os << "{\"runs\": " << fgc_runs_
+     << ", \"config\": {\"cores\": " << num_cores
+     << ", \"warps\": " << VX_CFG_NUM_WARPS
+     << ", \"threads\": " << VX_CFG_NUM_THREADS << "}"
+     << ", \"mem\": {\"reads\": " << perf_mem_reads_
+     << ", \"writes\": " << perf_mem_writes_
+     << ", \"latency\": " << perf_mem_latency_ << "}"
+     << ", \"pc_fields\": [\"issue\", \"lanes\", \"scrb\", \"head\", \"fetch\", \"wait\", \"idle\", \"commits\", \"latency\", \"disp\"]"
+     << ", \"cores\": [";
+  for (uint32_t c = 0; c < num_cores; ++c) {
+    auto* core = clusters_.at(c / cores_per_cluster)->get_core(c % cores_per_cluster);
+    auto& p = core->perf_stats();
+    os << (c ? "," : "") << "\n {\"core\": " << c;
+  #define FGC_OUT(name) os << ", \"" #name "\": " << p.name
+    FGC_OUT(cycles); FGC_OUT(instrs); FGC_OUT(sched_idle);
+    FGC_OUT(active_warps); FGC_OUT(stalled_warps);
+    FGC_OUT(issued_warps); FGC_OUT(issued_threads);
+    FGC_OUT(fetch_stalls); FGC_OUT(ibuf_stalls); FGC_OUT(scrb_stalls); FGC_OUT(opds_stalls);
+    FGC_OUT(alu_stalls); FGC_OUT(fpu_stalls); FGC_OUT(lsu_stalls); FGC_OUT(sfu_stalls);
+    FGC_OUT(branches); FGC_OUT(divergence);
+    FGC_OUT(alu_instrs); FGC_OUT(fpu_instrs); FGC_OUT(lsu_instrs); FGC_OUT(sfu_instrs);
+    FGC_OUT(ifetches); FGC_OUT(loads); FGC_OUT(stores);
+    FGC_OUT(ifetch_latency); FGC_OUT(load_latency);
+  #undef FGC_OUT
+    os << ", \"pcs\": {";
+    bool first = true;
+    for (auto& [pc, s] : core->fgc_pcs()) {
+      os << (first ? "" : ", ") << "\"0x" << std::hex << pc << std::dec << "\": ["
+         << s.issue << ", " << s.lanes << ", " << s.scrb << ", " << s.head << ", "
+         << s.fetch << ", " << s.wait << ", " << s.idle << ", " << s.commits << ", " << s.latency << ", "
+         << s.disp << "]";
+      first = false;
+    }
+    os << "}}";
+  }
+  os << "]";
+  // memory levels: L1 data caches (all sockets), L2 (all clusters), L3, DRAM
+  fgc::MemStats l1, l2;
+  std::vector<const Socket*> seen;
+  for (uint32_t c = 0; c < num_cores; ++c) {
+    auto* socket = clusters_.at(c / cores_per_cluster)->get_core(c % cores_per_cluster)->socket();
+    if (std::find(seen.begin(), seen.end(), socket) == seen.end()) {
+      seen.push_back(socket);
+      l1 += socket->perf_stats().dcache.fgc;
+    }
+  }
+  for (auto& cluster : clusters_) {
+    l2 += cluster->perf_stats().l2cache.fgc;
+  }
+  os << ",\n \"tags\": [";
+  for (size_t t = 0; t < fgc::tags().size(); ++t) {
+    auto& tag = fgc::tags().at(t);
+    os << (t ? ", " : "") << "{\"name\": \"" << tag.name << "\", \"base\": " << tag.base << ", \"size\": " << tag.size << "}";
+  }
+  os << "], \"flow_fields\": [\"rd\", \"wr\", \"wr_bytes\", \"amo\"]";
+  fgc_dump_mem(os, "l1", l1);
+  fgc_dump_mem(os, "l2", l2);
+  fgc_dump_mem(os, "l3", l3cache_->perf_stats().fgc);
+  fgc_dump_mem(os, "dram", memsim_->perf_stats().fgc);
+  os << "}\n";
 }
 
 void ProcessorImpl::cp_mem_write(uint64_t addr, const void* src, uint64_t size, bool noalloc) {

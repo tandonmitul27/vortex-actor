@@ -79,6 +79,9 @@ public:
   // Cycle the instruction entered its warp's instruction buffer.
   uint64_t ibuf_time;
 
+  // Cycle the uop issued (fgc counters).
+  uint64_t issue_time;
+
   instr_trace_t(uint64_t uuid)
     : uuid(uuid)
     , cid(0)
@@ -104,6 +107,7 @@ public:
     , fetch_stall(false)
     , resume_warp(false)
     , ibuf_time(0)
+    , issue_time(0)
     , log_once_(false)
   {}
 

@@ -105,6 +105,96 @@ uint32_t AluUnit::latency_of(const instr_trace_t* trace) const {
 	std::abort();
 }
 
+#if VX_CFG_ICALL_SPLIT_ENABLED
+namespace {
+
+bool is_link_reg(const RegOpd& r) {
+  return r.type == RegType::Integer && (r.idx == 1 || r.idx == 5);
+}
+
+// Starts the next target of a divergent call: the pending lanes that share
+// the lowest pending lane's target. Returns false once every lane has run.
+bool icall_next(Core* core, uint32_t wid, warp_t& warp) {
+  auto& e = warp.ipdom_stack.top();
+  ThreadMask pending = e.orig_tmask & ~e.done;
+  if (pending.none()) {
+    return false;
+  }
+  uint32_t first = 0;
+  while (!pending.test(first)) ++first;
+  Word target = e.targets.at(first);
+  ThreadMask group(pending.size());
+  for (uint32_t t = first; t < pending.size(); ++t) {
+    if (pending.test(t) && e.targets.at(t) == target) {
+      group.set(t);
+    }
+  }
+  e.done |= group;
+  e.depth = 0;
+  core->setTmask(wid, group);
+  warp.PC = target;
+  return true;
+}
+
+// A call or return seen by a warp: splits a call whose target differs
+// across lanes, counts calls nested in the current target, and on the
+// target's return either starts the next target or rejoins the lanes.
+void icall_branch(Core* core, Scheduler& sched, instr_trace_t* trace, warp_t& warp,
+                  const RegDataVec& rs1_data, Word offset, Word link_pc) {
+  auto& stack = warp.ipdom_stack;
+  bool is_call = is_link_reg(trace->dst_reg);
+  bool is_ret = !is_call && trace->src_regs.size() != 0 && is_link_reg(trace->src_regs[0]);
+  if (is_call) {
+    uint32_t num_threads = warp.tmask.size();
+    std::vector<Word> targets(num_threads, 0);
+    bool divergent = false;
+    int32_t first = -1;
+    for (uint32_t t = 0; t < num_threads; ++t) {
+      if (!warp.tmask.test(t)) continue;
+      targets[t] = (rs1_data[t].u + offset) & ~Word(1);
+      if (first < 0) {
+        first = t;
+      } else if (targets[t] != targets[first]) {
+        divergent = true;
+      }
+    }
+    if (!divergent) {
+      if (!stack.empty() && stack.top().icall) {
+        ++stack.top().depth;
+      }
+      return;
+    }
+    if (stack.size() == sched.ipdom_size()) {
+      std::cout << "IPDOM stack is full! size=" << stack.size() << ", PC=0x" << std::hex << trace->PC << std::dec << " (#" << trace->uuid << ")\n" << std::flush;
+      std::abort();
+    }
+    stack.emplace(warp.tmask, link_pc);
+    auto& e = stack.top();
+    e.icall = true;
+    e.link_PC = link_pc;
+    e.targets = std::move(targets);
+    core->perf_stats().divergence += 1;
+    icall_next(core, trace->wid, warp);
+  } else if (is_ret && !stack.empty() && stack.top().icall) {
+    auto& e = stack.top();
+    if (e.depth != 0) {
+      --e.depth;
+      return;
+    }
+    if (warp.PC != e.link_PC) {
+      return;
+    }
+    if (!icall_next(core, trace->wid, warp)) {
+      core->setTmask(trace->wid, e.orig_tmask);
+      warp.PC = e.link_PC;
+      stack.pop();
+    }
+  }
+}
+
+} // namespace
+#endif
+
 void AluUnit::execute(instr_trace_t* trace) {
 	auto& sched = core_->scheduler();
 	auto& warp = sched.warp(trace->wid);
@@ -407,6 +497,12 @@ void AluUnit::execute(instr_trace_t* trace) {
 				rd_data[t].i = link_pc;
 			}
 			warp.PC = trace->PC + offset;
+#if VX_CFG_ICALL_SPLIT_ENABLED
+			if (trace->eop && is_link_reg(trace->dst_reg)
+			 && !warp.ipdom_stack.empty() && warp.ipdom_stack.top().icall) {
+				++warp.ipdom_stack.top().depth;
+			}
+#endif
 			core_->perf_stats().branches += 1;
 		} break;
 		case BrType::JALR: {
@@ -419,6 +515,13 @@ void AluUnit::execute(instr_trace_t* trace) {
 			// JALR clears bit 0 of the computed target (RISC-V ISA); the RTL
 			// release build drops it implicitly via from_fullPC() truncation.
 			warp.PC = (rs1_data[thread_last].u + offset) & ~Word(1);
+#if VX_CFG_ICALL_SPLIT_ENABLED
+			// The last packet holds every lane's operands: rs1_data is the
+			// warp's, only the packet's tmask is narrowed.
+			if (trace->eop) {
+				icall_branch(core_, sched, trace, warp, rs1_data, offset, link_pc);
+			}
+#endif
 			core_->perf_stats().branches += 1;
 		} break;
 		case BrType::SYS:

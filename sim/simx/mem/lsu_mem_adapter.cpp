@@ -49,6 +49,7 @@ LsuMemAdapter::LsuMemAdapter(
       // address class once so consumers don't re-derive it.
       mr.flags = req.flags;
       mr.amo_cmp = req.amo_cmp.at(0);
+      mr.pc = req.pc;
       auto t = get_addr_type(mr.addr);
       mr.flags.io    = (t == AddrType::IO);
       mr.flags.local = (t == AddrType::Shared);
@@ -138,6 +139,7 @@ void LsuMemAdapter::on_tick() {
       out_req.tag     = in_req.tag;
       out_req.hart_id = make_hart_id(in_req.cid, in_req.wid, in_req.tids.at(i));
       out_req.uuid    = in_req.uuid;
+      out_req.pc      = in_req.pc;
       out_req.data    = in_req.data.at(i);
       out_req.byteen  = in_req.byteen.at(i);
       out_req.amo_cmp = in_req.amo_cmp.at(i);

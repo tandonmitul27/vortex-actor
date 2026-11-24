@@ -17,6 +17,7 @@
 #include "types.h"
 #include <mempool.h>
 #include "instr_trace.h"
+#include "fgc_stats.h"
 #include "VX_config.h"
 #ifdef VX_CFG_VM_ENABLE
 #include "mem/tlb_types.h"
@@ -192,6 +193,8 @@ public:
 
   const PerfStats& perf_stats() const;
   PerfStats& perf_stats();
+
+  const fgc::PcMap& fgc_pcs() const;
 
   int get_exitcode() const;
 

@@ -724,6 +724,7 @@ void LsuUnit::process_request_step(uint32_t b) {
 		LsuReq lsu_req(VX_CFG_NUM_LSU_LANES);
 		// LsuReq.write is derived from op via is_write(); no separate field.
 		lsu_req.wid = trace->wid;
+		lsu_req.pc  = trace->PC;
 		// Typed op (warp-uniform). For AMO, amo_to_memop() picks the family
 		// member; for plain stores/loads, it's ST/LD. AMO MIN/MAX collapse
 		// signed/unsigned into one op + flag.

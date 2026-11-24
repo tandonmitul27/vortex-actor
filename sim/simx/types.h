@@ -1194,6 +1194,7 @@ struct LsuReq {
   uint32_t cid;
   uint32_t wid;
   uint64_t uuid;
+  uint64_t pc = 0;  // the load/store's PC, for the fgc counters
 
   LsuReq(uint32_t size)
     : op(MemOp::LD)
@@ -1307,6 +1308,7 @@ struct MemReq {
   uint32_t tag;
   uint32_t hart_id;
   uint64_t uuid;
+  uint64_t pc = 0;  // the load/store's PC, for the fgc counters
   MemFlags flags;
   // Under cache line merging: the tags of the ports merged into this read, by
   // offset in the leader's merge group. They ride the bank access and its

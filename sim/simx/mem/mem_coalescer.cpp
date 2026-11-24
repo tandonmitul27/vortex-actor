@@ -278,6 +278,7 @@ void MemCoalescer::on_tick() {
     mr.tag    = tag;
     mr.hart_id = make_hart_id(in_req.cid, in_req.wid, out_tids.at(o));
     mr.uuid   = in_req.uuid;
+    mr.pc     = in_req.pc;
     mr.flags  = in_req.flags;
     auto t = get_addr_type(mr.addr);
     mr.flags.io    = (t == AddrType::IO);

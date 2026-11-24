@@ -14,6 +14,7 @@
 #pragma once
 
 #include "types.h"
+#include "fgc_stats.h"
 #include <mem.h>
 #include <dram_sim.h>
 #include <functional>
@@ -29,9 +30,11 @@ public:
 
 	struct PerfStats {
 		uint64_t bank_stalls = 0;
+		fgc::MemStats fgc;
 
 		PerfStats& operator+=(const PerfStats& rhs) {
 			this->bank_stalls += rhs.bank_stalls;
+			this->fgc += rhs.fgc;
 			return *this;
 		}
 	};
